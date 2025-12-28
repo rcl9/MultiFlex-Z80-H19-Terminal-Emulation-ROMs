@@ -1,0 +1,4190 @@
+.comment\
+**************************************************************
+
+            H-19 (VT52-ADM3A) Emulation Terminal 
+
+                     Copyright (c) 1986
+
+                             By RCL9
+
+        (Rob's Retro Computing Archive) 
+     RetroComputingArchive@gmail.com
+                          github.com/rcl9
+
+                    Version 2.6 - February 12, 1988
+
+**************************************************************
+
+Version:
+
+2.6	(2/12/88)
+	Enter setup screen from remote mode with Shift+Control+ESC
+		or Shift+Caps+Control+ESC. Required new keybd6.rom.
+	Fixed screen saver so any key turns screen back on.
+	Setup mode no longer sends ^S and ^Q to remote computer.
+
+2.5	(8/18/86)
+	Fixed outstanding bugs or problems.
+	Debugged 24*96 video modes, and status line modes.
+	Finally got 40*96 interlace working via hardware mod.
+	Sped up general performance
+
+2.4	(6/19/86)
+	Added huge input RS-232 buffer to keep up with 9600 baud
+	Added ADM3A terminal emulation
+
+2.3	(5/7/86)
+	Continued debugging 
+	Added screen save option
+	Added Xon/Xoff handshaking disable option
+
+2.2	(4/10/86)
+	Continued debugging - fixed Stop bits/Data bits bug
+
+2.1	(12/27/85)
+	Turned into Heathkit H-19 Emulation terminal.
+
+2.0	(12/25/85)
+	Adjusted video parameters
+	Also reprogrammed keyboard 2716.
+
+1.9	(12/19/84)
+	Added Z80 Monitor (took out in later version)
+
+1.8	(06/21/84)
+	Original Disassembed version
+
+Possible improvements:
+
+     - add hold mode (stops after 1 page, 1 line or 1 char)
+
+Compile within CP/M by:
+	m80 = term26
+Link by:   
+	l80 term26,term26/n/e
+And rename the linked file "term26.com" to "term26.rom" for burning to the EPROM.
+
+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*
+
+Hardware mods needed:
+
+1) Change system clock to 13mhz crystal
+
+2) Remove IC U41 (74LS163) and solder together pins 9 and 12
+   on bottom of the board (this makes the VSYNC pulse the
+   normal 16 scan lines that the 6845 expects for interlace
+   mode).
+
+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+*+* \
+
+	ASEG
+	.Z80
+	TITLE H-19 & ADM3A Emulation terminal 
+
+.comment\
+----------------- Config Port Mapping ---------------------
+
+Bit 7: 	No jumper 	= local
+	Jumper		= remote mode
+
+Bit 6:	No jumper 	= dont enable auto screen-save mode
+	Jumper		= enable auto-screen save mode
+
+Bit 5:	No jumper	= dont use XON/XOFF protocol (DTR still active)
+	Jumper		= use XON/XOFF as well as DTR
+
+Bit 4,3,2,1		= baud rate
+
+Bit 0:	Reserved by keyboard strobe bit
+
+	4321    Baud Rate
+	----    ---------
+	....	50
+	...x	75
+	..x.	110
+	..xx	134.5		x = jumpered
+	.x..	150		. = not jumpered
+	.x.x	300
+	.xx.	600
+	.xxx	1200
+	x...	1800
+	x..x	2000
+	x.x.	2400
+	x.xx	3600
+	xx..	4800
+	xx.x	7200
+	xxx.	9600
+	xxxx	19200 (not supported by 8251 UART)
+\
+; ------------------ Memory Map Equates ----------------------
+
+vid$mem	equ	04000h
+
+screen1	equ	00000h	; default screen 4000H-49ff (26 * 96 max)
+screen2	equ	00a00h	; Alternate screen 4a00-53ff (26 * 96 screen)
+screen3	equ	01400h	; Status screen 5400-5dffh (24 * 80 screen)
+
+; the input buffer co-incides with the setup screen memory
+charbuf	equ	screen3+vid$mem	; 2816 byte input buffer 
+buftop	equ	05effh		; top of input buffer
+
+	.phase 05f00h
+
+variables:
+
+emu$type: db	00	; 0 = VT52, 1 = ADM3a
+buff$percent: db 00	; % of buffer before sending XOFF (1-100)
+int$esc:  db	00	; Escape level in keybd interrupt routine
+setup$mode:db	00	; FF = setup screen in use (rechannels interrupts)
+screen$mode:db	00	; 0 = 24*80, 1 = 25*80,etc.
+screen$save:db	00	; holds (screen$mode) during setup screen
+orig$mode:db	00	; original screen mode when entering setup screen
+
+num$colms:dw	0000	; number of rows in screen format
+num$rows: dw	0000	; number of columns in screen format (not inc. status line)
+page$size:dw	0000	; size of screen, ie 24 * 80 = 1920
+stat$line:db	00	; 0FF = yes, 00 = no status line at bottom of screen
+
+tbl$loc:  db	00	; part of escape level processing
+esc$param1:db	00	; 3rd character of the escape seqence
+
+rownumº	  db	00	; current row of the cursor
+colmnum:  db	00	; current column of the cursor
+saved$row:db	00	; saved row number (H-19 command)
+saved$colm:db	00	; saved colunm number (H-19 command)
+
+saver:    db	00	; NZ = screen save option enabled
+timeout:  db	00	; timeout in minutes for screen saver
+timeout$clks: db 00	; number of clocks in screen timeout loop
+wrap$around:db	00	; FF = chars wrap$around, 00 = cursor stays on same line
+graf$mode: db	00	; FF = graphic mode, 00 = no graphic mode
+send$lf:  db 	00	; FF = send lf after cr
+send$cr$flg: db	00	; FF = send CR after lf sent
+keybd$locked:db	00	; FF = keyboard locked
+insert$mode:db	00	; FF = insert mode on
+eoln$beep:db	00	; FF = beep at end of line
+curs$start:db	00	; 6845 Register R10 image
+curs$end: db	00	; 6845 Register R11 image
+blink:	  db	00	; FF = blink cursor, 00 = no blink
+screen$num:db 	00	; 00 = 1st screen, 1 = 2nd screen
+
+rem$loc:  db	00	; Remote(1)/local(0) flag
+baudrate: db	00	; current baudrate 
+databits: db	00	; # of data bits used.
+parity:	  db	00	; Type of parity used.
+stopbits: db	00	; Number of stop bits used. (2-5)
+atrtype:  db	00	; Type of attribute currently using.
+rev$nor:  db	00	; Reverse(1)/Normal(0) screen flag
+page$ptr: dw	0000	; offset to current video page
+page$save:dw	0000	; save loc. of page pointer for setup screen
+alt$curs: dw	0000	; cursor location in alternate screen
+
+cursloc:  dw	0000	; old cursor location for setup screen
+esc$level:db	00	; 0 = no ESC in progress, 1 expect '=',
+			; 2 = expect colm, 3 = expect row #
+atr$flag: db	00	; attribute flag
+temp$atr: db	00	; attribute temp storage during setup screen
+newptr:	  dw	0000	; next location for char in INT. buffer
+oldptr:	  dw	0000	; old loc. to get char from in buffer
+xoff$dtr: db	00	; 1 = XON sent (+ DTR high)
+			; 0 = XOFF sent (+ DTR low)
+use$xon:  db	00	; 1 = use XON/XOFF + DTR line
+			; 0 = only use the DTR line
+outer$cnt:db	00	; screen saver outer loop count
+inner$cnt:dw	0000	; screen saver inner loop count
+mon$set$mode:db	00	; if = f0h then interrupt wants foreground
+			; to enter the setup screen.
+interlace:db	00	; NZ if video is interlaced (used by cursor routines)
+goto$screen1: db 00	; NZ if setup return should change to screen 1
+key$pressed:db	00	; NZ if key pressed. Used by screen saver routine.
+
+length$of$variables	equ	 $ - variables
+
+	.dephase
+
+stack		equ	05fffH	; locate at top of video memory
+
+; ----------------- I/O Map Equates -------------------
+
+timer$0		equ	00H	; 8253 Counter 0
+timer$1		equ	01H	; 8253 Counter 1
+timer$2		equ	02H	; 8253 Counter 2
+timer$stat	equ	03H	; 8253 Timer Control Register
+
+usart$data	equ	04H	; 8251 USART data register
+usart$stat	equ	05H	; 8251 USART status register
+
+vid$reg		equ	08H	; 6845 Register # register
+vid$data	equ	09H	; 6845 Data register
+
+keybd$data	equ	0CH	; Keyboard data register
+keybd$stat	equ	0DH	; Keyboard status register
+
+cr	equ	0dh
+lf	equ	0ah
+esc	equ	01bh
+bell	equ	07h
+
+; ---------------------------------------------------------
+
+	org	0
+
+cold$start:
+	di
+	jp	start
+
+; ----------------------------------------------------------
+
+; Mode 1 Interrupt Processing for keyboard and USART
+
+	ORG	38H
+
+	push	af
+	push	bc
+	push	de
+	push	hl
+	in	a,(usart$stat)	; anything waiting in USART?
+	and	02H
+	call	nz,in$usart	; yes, go process it
+	in	a,(keybd$stat)	; keyboard character waiting?
+	and	01H
+	call	nz,in$keybd	; yes, go process it
+	pop	hl
+	pop	de
+	pop	bc
+	pop	af
+	ei
+	reti			; return to terminal program
+
+; ------ Various video formats for 6845 video chip ----------
+
+inter$offset	equ	8	; offset to interlace registerin tables
+
+
+; These tables are arranged such that the odd numbered are
+; normal formats, while even numbered are the staus line formats
+
+; NOTE: by removing IC41, we now need 16 lines of raster
+; for VSYNC, so the status lines use to get cut off if
+; they were programmed with 252 lines, so use 256 lines instead.
+; (except for interlace, play around with R4 and R5 to get correct)
+
+; 24 * 80, 15750, 60
+
+vidtbl1:defb	089H	; R0  - Horizontal total
+	defb	050H	; R1  - Horizontal columns displayed
+	defb	067H	; R2  - Horizontal sync position
+	defb	00AH	; R3  - Horizontal sync width
+	defb	019H	; R4  - Vertical total
+	defb	002H	; R5  - Vertical total adjustment
+	defb	018H	; R6  - Vertical rows displayed
+	defb	018H	; R7  - Vertical sync position
+	defb	000H	; R8  - No interlace
+	defb	009H	; R9 -  Maximum scanline
+
+; 25 * 80 (for status line at bottom)
+; use 256 line for programming
+
+vidtbl2:defb	089H,050H,067H,0AH,019H,06H,019H,019H,0H,09H
+
+; 40 * 96, 15750, 60, Interlace
+; Calculate like a 20*96 display but program R7 = R6
+; and use 12 scan lines
+
+vidtbl3:defb	089H,060H,06FH,0AH,015H,00H,014H,014H,3H,0BH
+
+; 44 * 96, 15750, 60, Interlace
+; Calculate like 22*96 display with R7=R6 and 12 scan lines
+; R5 and R6 were guessed at to make display work ok
+
+vidtbl4:defb	089H,060H,06FH,0AH,015H,08H,016H,015H,3H,0BH
+
+; 24 * 96, 15750, 60
+
+vidtbl5:defb	089H,060H,06FH,0AH,019H,02H,018H,018H,0,09H
+
+; 25 * 96, 15750, 60
+; use 256 lines for programming
+
+vidtbl6:defb	089H,060H,06FH,0AH,019H,06H,019H,019H,0,09H
+
+; static registers R8-R15
+
+ra$r15:	defb	060H	; R10 - Cursor start
+	defb	009H	; R11 - Cursor end
+	defb	000H	; R12 - Start address (H)
+	defb	000H	; R13 - Start address (L)
+	defb	000H	; R14 - Cursor (H)
+	defb	000H	; R15 - Cursor (L)
+
+
+; --------------- Initialization Code --------------------
+
+start:	ld	sp,stack
+	im	1		; set interrupt mode so
+				; INT/ does a RST 38H
+
+; initialize the data pointer/flags area
+
+	xor	a
+	ld	b,length$of$variables
+	ld	hl,variables	; point to start of data table
+initptr:ld	(hl),a		; and clear the variables
+	inc	hl
+	djnz	initptr
+
+	ld	hl,charbuf
+	ld	(newptr),hl	; init the interrupt buffer
+	ld	(oldptr),hl	; to 0 characters
+
+; to default stat$line to on, have to call 'stat$line$on'
+	xor	a
+	ld	(stat$line),a	; say no status line
+
+	call	init$switches	; init switches & I/O
+
+; initialize the 6845 registers
+
+; assume no interlace screen on powerup (so cursor start and
+; end addresses dont both have to be even or odd).
+
+	ld	a,68h
+	ld	(curs$start),a	; define underscore blinking cursor
+	ld	a,9
+	ld	(curs$end),a
+	ld	a,0ffh
+	ld	(blink),a	; say we have set blinking on
+
+	ld	a,(rem$loc)	; see which mode we are in
+	or	a
+	jr	nz,rem$s	; remote, jump
+	ld	a,0		; Local mode, must be 24 * 80!!
+	ld	(screen$mode),a	;  so dont change this!
+	jr	setscn
+
+rem$s:	ld	a,0		; in remote mode, can be any
+	ld	(screen$mode),a	; format:say 24 * 80 default
+
+setscn:	ld	hl,0		; start display on first page
+	call	pgm$6845	; go program the registers
+
+	call	init$scr	; clear screen and init video
+				; page pointers to top 1st page
+
+	ld	hl,greeting
+	call	prtstr
+	ld	hl,local$msg
+	call	prtstr
+	ei
+	jp	getachar
+
+; this is called by the 'reset to power on switches ESC sequence'
+
+init$switches:
+
+	ld	a,7		 ; select 70 % full buffer
+	ld	(buff$percent),a ; set the % of buffer full before send XOFF
+
+	ld	a,10
+	ld	(timeout),a	; set 10 minute screen saver timeout
+	ld	a, 10 * 9
+	ld	(timeout$clks),a ; and timeout * 9
+
+	ld	a,0
+	ld	(emu$type),a	; emulate VT52
+	ld	(wrap$around),a	; chars. do not wrap around.
+	ld	(setup$mode),a	; no setup mode screen
+	ld	(graf$mode),a	; no graphic mode
+	ld	(send$lf),a	; dont send lf after cr
+	ld	(send$cr$flg),a	; dont send cr after lf
+	ld	(keybd$locked),a ; dont lock keyboard
+	ld	(insert$mode),a	; insert char mode off
+	ld	(xoff$dtr),a	; no Xoff sent yet.
+	ld	(int$esc),a	; no escape processing
+	ld	(eoln$beep),a	; default end of line beep off
+
+	in	a,(keybd$stat)
+	and	020h
+	ld	(use$xon),a	; set XON/XOFF protocol state
+
+	in	a,(keybd$stat)	; get jumper status
+	and	40h
+	ld	(saver),a 	; init screen save option
+
+	ld	a,1		; default to 8 data bits
+	ld	(databits),a	; init data bits
+
+	ld	a,000H		; init parity to off
+	ld	(parity),a
+
+	ld	a,000H		; init stop bits to 1
+	ld	(stopbits),a
+
+	ld	a,001H		; init attribute to DIM
+	ld	(atrtype),a
+
+	ld	a,000H		; init. screen to no inverse
+	ld	(rev$nor),a
+
+; get default baudrate
+
+	in	a,(keybd$stat)	; get jumpers status
+	srl	a		; get rid of the keybd status
+	and	00fH		; keep 3 bits
+	ld	(baudrate),a	; and store the baudrate
+
+; set remote/local mode
+
+	in	a,(keybd$stat)	; again, get jumpers status
+	rlca			; store Remote/local in bit 0
+	and	001H		; and keep this bit
+	ld	(rem$loc),a	; 0=local mode, 1=remote mode
+
+; program timers and usart
+
+	ld	a,036H		; select counter 0, square wave
+	out	(timer$stat),a	; R/LD lsb first, 16* clock
+				; divisor, binary count
+
+	ld	a,0B6H		; save as above but select
+	out	(timer$stat),a	; counter 2 (speaker output)
+
+	call	prgm$io		; program timers and USART
+	ret
+
+greeting:	defb	'H-19 (VT52/ADM3A) Emulation Terminal. Version 2.6.',cr
+		defb	'Copyright (c) August 20, 1986 by RCL9.',cr,cr
+
+		defb	'`Shift-Control-ESC` enters setup screen if in remote',cr,lf
+		defb	'mode or `ESCxx` if in local mode.',cr,0
+
+local$msg:
+	defb	cr,'LOCAL mode 64 line text buffer editing commands:',cr,cr
+	defb	'     - cursor and paging control similar to Wordstar',cr
+	defb	'     - ^L = clear buffer (clear this screen).',cr
+	defb	'     - ^V = attribute on.',cr
+	defb	'     - ^B = attribute off.',cr
+	defb	'     - ^T = transmit buffer w/o attributes.',cr
+	defb	'     - ^0 = send break.',cr,0
+
+; program 6845 to one of 4 video formats
+
+; hl = start of display ram to be used (0 = screen1, etc)
+; (screen$mode) contains screen mode wanted
+
+pgm$6845:
+	push	de
+	push	hl
+	ld	a,(screen$mode)
+	ld	e,a
+	sla	a		; * 2
+	add	a,e		; * 3
+	sla	a		; * 6
+	ld	hl,vidtbls
+	ld	e,a
+	ld	d,0
+	add	hl,de
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)		; get table address
+	inc	hl
+	ld	a,(hl)
+	ld	(num$rows),a
+	inc	hl
+	ld	a,(hl)
+	inc	hl
+	ld	(num$colms),a
+	ld	a,0
+	ld	(num$rows+1),a
+	ld	(num$colms+1),a
+
+	push	de		; pick up the page size
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)
+	ld	(page$size),de
+	pop	hl
+
+	push	hl
+	ld	de,inter$offset	
+	add	hl,de
+	ld	a,(hl)		; get interlace register value
+	and	1		; see if interlace on
+	ld	(interlace),a	; and store it for cursor
+	pop	hl		;   routines access
+
+	ld	b,10
+	ld	c,0
+	call	send$6845	; program 1st 10 registers
+
+	ld	b,6
+	ld	c,0ah
+	ld	hl,ra$r15
+	call	send$6845	; program last 6 static registers
+
+	pop	hl
+	call	updat$vm	; point 6845 at new video memory
+	pop	de
+
+	call	pgm$cursor	; program cursor characteristics
+	ret
+
+; send data stream to 6845
+
+send$6845:
+	ld	a,c		; get which register to program
+	out	(vid$reg),a	; tell 6845 which register to
+				; send the next data to.
+	ld	a,(hl)		; grab the register data init.
+	out	(vid$data),a	; and initialize that register
+	inc	c		; inc. the register number
+	inc	hl		; and the data table location
+	djnz	send$6845	; loop till all 16 programmed
+	ret
+
+vidtbls:defw	vidtbl1		; 24 * 80
+	defb	24,80
+	defw	1920
+
+	defw	vidtbl2		; 25 * 80 (status line)
+	defb	24,80	
+	defw	1920
+
+
+	defw	vidtbl3		; 40 * 96
+	defb	40,96
+	defw	3840
+
+	defw	vidtbl4		; 42 * 96 (status line)
+	defb	40,96
+	defw	3840
+
+
+	defw	vidtbl5		; 24 * 96
+	defb 	24,96	
+	defw	2304
+
+	defw	vidtbl6		; 25 * 96 (status line)
+	defb	24,96
+	defw	2304
+
+
+; Clear ALL video display memory
+
+init$scr:
+
+	ld	hl,0
+	ld	(alt$curs),hl	; set alternate screen cursor loc. to home
+	ld	hl,00		; video mem offset starts at 0 
+	call	updat$vm
+	ld	hl,00		; set cursor to 1st vid mem loc.
+	call	movcurs
+	ld	bc,charbuf - vid$mem
+	ld	hl,0		; point to video display memory
+	call	erase		; and erase the screen
+	ret
+
+; Make up a USART mode command and program the Timers and
+; USART for the new baudrate.
+
+prgm$io:call	prgbaud		; program baud rate
+	xor	A		; init USART into command mode
+	out	(usart$stat),a
+	out	(usart$stat),a	; *** should be 5 zeros, not 3!
+	out	(usart$stat),a
+	ld	a,040H		; put USART into Mode operation
+	out	(usart$stat),a
+	ld	d,01001010B	; set default USART mode byte:
+				; 1 stop bit, no parity, 7 data
+				; bits, 16* clock rate
+
+; now form the mode control byte for the USART
+
+	ld	a,(databits)	; place number of data bits
+	sla	a		; in mode byte
+	sla	a
+	or	d
+	ld	d,a
+	ld	a,(parity)	; then place parity
+	sla	a
+	sla	a
+	sla	a
+	sla	a
+	or	d
+	ld	d,a
+	ld	a,(stopbits)	; and finally # of stop bits
+	rrca
+	or	d
+	out	(usart$stat),a	; program USART mode register
+
+	ld	a,007H		; and set command to xmit &
+	out	(usart$stat),a	; receive enable, DTR/ low
+
+;         Form the keyboard control mode byte
+;
+; bit 0 - attribute
+;     1 - attribute
+;     2 - display ON
+;     3 - Screen reverse video (independent of the attribute)
+;
+; Attribute:  00 = None
+;             01 = Dim
+; 	      10 = Reverse video
+; 	      11 = Alternate character set 
+
+
+prg$atr:ld	a,(atrtype)
+	ld	d,004H		; set display on
+	or	d
+	ld	d,a
+	ld	a,(rev$nor)	; 1 = reverse video
+	sla	a
+	sla	a
+	sla	a
+	or	d		; and set in control byte
+	out	(keybd$stat),a	; then send to video circuitry
+	in	a,(keybd$data)	; clear any keybd characters
+	ei			; enable all the interrupts
+	ret
+
+; Program baud rate
+
+prgbaud:ld	a,(baudrate)	; get the current baudrate
+	sla	a
+	ld	e,a
+	ld	d,000H
+	ld	hl,baudtbl	; point to baudrate timer table
+	add	hl,de		; hl points to baudrate counter
+				; value table
+	ld	a,(hl)
+	out	(timer$0),a	; output LSB of baudrate
+	inc	hl
+	ld	a,(hl)
+	out	(timer$0),a	; output MSB of baudrate
+	ret
+
+; Counter values for 16 different baudrates
+
+baudtbl:
+
+	defw	2500	; 50 baud
+
+	defb	083H	; 75 baud
+	defb	006H
+
+	defb	070H	; 110 baud
+	defb	004H
+
+	defw	929	; 134.5 baud
+
+	defb	041H	; 150 baud
+	defb	003H
+
+	defb	0A1H	; 300 baud
+	defb	001H
+
+	defb	0D0H	; 600 baud
+	defb	000H
+
+	defb	068H	; 1200 baud
+	defb	000H
+
+	defb	045H	; 1800 baud
+	defb	000H
+
+	defw	62	; 2000 baud
+
+	defb	034H	; 2400 baud
+	defb	000H
+
+	defw	35	; 3600 baud
+
+	defb	01AH	; 4800 baud
+	defb	000H
+
+	defw	17	; 7200 baud
+
+	defb	00DH	; 9600 baud
+	defb	000H
+
+	defb	6	; 19200 baud (not supported)
+
+; -------------- Start of character processing ---------------
+
+; This routine loops processing the characters in the input
+; buffer and attends to the XON/XOFF protocol. While this
+; is executing, the USART interrupt routine is filling up
+; the character buffer - thats why this keeps in its tight
+; loop.
+
+; in the background, the interrupts from the keyboard and
+; USART are either filling up the buffer (remote mode) or
+; the keyboard data goes directly to 'local' if in local mode.
+
+; If Shift+Control+ESC is pressed (remote mode),the 
+; corresponding flags are set in the background and the
+; process is started in the foreground.
+
+; The screen saver is implemented here. If it times out then turns
+; the screen off and waits for a character to be typed then
+; turns screen back on.
+
+getachar:ld	hl,0ffffh	; inner count = 6.47 sec = 98.8us * 65536 
+	ld	(inner$cnt),hl
+	ld	a,(timeout$clks) ; get number of clocks for internal loop
+	ld	(outer$cnt),a
+
+; inner loop takes 214 cyles (average) = 98.8us (2.17 mhz clock)
+
+geta2:	ld	a,(mon$set$mode) ; (13)
+
+grab1:	or	a		; (7) keybd interrupt set setup mode
+	jr	z,grab2		; (12) flag to go into setup screen?, no, jump
+	xor	a
+	ld	(mon$set$mode),a 
+	call	setup$screen	; yes, call keybd routine
+	jr	geta2
+
+grab2:	call	from$buf	; (17) get character from buffer
+	jr	z,no$char
+
+	call	local		; got character, go process it
+	jr	getachar	; loop some more
+
+; no char in input buffer, check for XOFF flag active.
+
+no$char:call	turn$on$xmit	; try turning on remote sending
+
+	ei			; (4)
+	ld	hl,(inner$cnt)	; (16) decrement inner counter
+	dec	hl		; (6) 
+	ld	a,h		; (4)
+	or	l		; (4)
+	jr	nz,loopb	; (12)
+	ld	hl,0ffffh	; update if underflow
+	ld	a,(outer$cnt)	; decrement outer counter
+	dec	a
+	jr	z,screen$off	; both zero, turn off screen
+	ld	(outer$cnt),a
+
+loopb:	ld	(inner$cnt),hl	; (16) update new value
+	jr	geta2		; (12) go process more input
+
+; turn off screen since timers timed out
+
+screen$off:
+	ld	a,(saver)	; is screen mode on?
+	or	a
+	jr	z,getachar	; no, dont turn off screen then
+	
+	ld	a,(atrtype)	; turn display off
+	ld	d,a
+	ld	a,(rev$nor)	; 1 = reverse video
+	sla	a
+	sla	a
+	sla	a
+	or	d		; and set in control byte
+	out	(keybd$stat),a	; then send to video circuitry
+	di
+	xor	a
+	ld	(key$pressed),a	; say no key pressed yet
+	ei
+
+sc$wait:ld	a,(key$pressed)	; See if key interrupt came in
+	or	a
+	jr	z,sc$wait
+
+	ld	a,(atrtype)
+	ld	d,004H		; set display on
+	or	d
+	ld	d,a
+	ld	a,(rev$nor)	; 1 = reverse video
+	sla	a
+	sla	a
+	sla	a
+	or	d		; and set in control byte
+	out	(keybd$stat),a	; then send to video circuitry
+
+	jp	getachar	; reprogram timers and wait for more input
+
+; get character from buffer , NZ = got char, Z = no char
+
+from$buf:
+	di			; (4)
+	ld	hl,(oldptr)	; (13) get old buffer location
+	ld	de,(newptr)	; (13) get new buffer location
+	call	cphlde		; compare
+	jr	z,fromret	; no char
+	ld	a,(hl)		; get the character
+	ld	c,a		; save it
+	inc	hl		; inc the old pointer
+	ld	de,buftop	; at top yet?
+	call	cphlde
+	jr	nz,from1	; no, not at top	
+	ld	hl,charbuf	; wrap around	
+from1:	ld	(oldptr),hl	; update oldptr
+	ld	a,c
+	cp	00
+	jr	nz,fromret	; return NZ flag
+	ld	a,1		; input char = 00, so do kludge
+	or	a		; to set Z flag = 0 (NZ)
+	ld	a,0
+fromret:ei
+	ret			; return NZ flag now
+
+; Process USART Interrupt
+
+; this routine uses a 255 character byte buffer to handle
+; high data transfer rates and possible overflow conflicts.
+
+; If we are in the setup screen mode, no characters are placed
+; in the buffer since the setup screen is now taking the place
+; of the input buffer (it has been killed)
+
+in$usart:
+	in	a,(usart$data)	; grab the serial data
+	and	07FH		; and make it ASCII
+	ld	c,a		; store away
+
+	ld	a,(setup$mode)	; dont place char in buffer
+	or	a		; if in setup screen mode
+	ret	nz
+
+
+; if in local mode then ignore any input data since we dont
+; care what remote user sends us (and we dont want machine
+; to process remote data)
+
+	ld	a,(rem$loc)	; which mode are we in?
+	or	a
+	ret	z		; return if local mode
+
+	ld	hl,(newptr)	; get new buffer location
+	ld	a,c		; get back the character
+	ld	(hl),a		; and store in interrupt buffer
+	inc	hl
+	ld	de,buftop	; at top yet?
+	call	cphlde
+	jr	nz,in2		; no, not at top	
+	ld	hl,charbuf	; wrap around	
+in2:	ld	de,(oldptr)
+	call	cphlde		; see if pointer collision
+	jr	z,ptr$notok	; oops, dont update pointer
+	ld	(newptr),hl	; update oldptr
+
+ptr$notok:
+	ld	hl,(oldptr)
+	ld	de,(newptr)
+	or	a		; kill C flag
+	sbc	hl,de
+	jr	nc,checkit
+
+	ld	de,buftop - charbuf ; get size of the buffer
+	add	hl,de		; get corrected size of free space
+
+; HL = free space remaining in the buffer
+
+; Check against user selected percentage of buffer full - if
+; over the limit then try sending XOFF
+
+checkit:
+	push	hl
+	ld	a,(buff$percent)
+	dec	a
+	sla	a
+	ld	e,a
+	ld	d,0
+	ld	hl,per$tbl
+	add	hl,de
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)
+	pop	hl
+	call	cphlde
+	ret	nc		; return if more than 40h bytes left
+	call	turn$off$xmit	; go turn off remote sending
+	ret
+
+; this is the percentage of the buffer that is empty before
+; we send an XOFF character
+
+per$tbl:dw	2534		; 10 % full
+	dw	2252		; 20 % full
+	dw	1971		; 30 % full
+	dw	1689		; 40 % full
+	dw	1408		; 50 % full
+	dw	1126		; 60 % full
+	dw	844		; 70 % full
+	dw	563		; 80 % full
+	dw	281		; 90 % full
+	dw	1		; 100 % full
+
+; Send out a character to the USART (wait till buffer empty)
+
+outuart:ld	c,a		; save character
+outwait:in	a,(usart$stat)	; get USART status
+	and	001H		; mask xmit buffer status
+	jr	z,outwait	; wait till buffer empty
+	ld	a,c		; and get back the character
+	out	(usart$data),a	; and send it to the USART
+	ret
+
+
+; Turn off remote transmission (if enabled)
+
+turn$off$xmit:
+
+	ld	a,(xoff$dtr)	; have we already set DTR high
+				; and/or sent XOFF?
+	or	a
+	ret	nz		; yes, dont do it again
+	ld	a,001H
+	ld	(xoff$dtr),a	; set xmission stop flag
+
+	ld	a,005H		; bring DTR* high (disable)
+	out	(usart$stat),a
+	ld	a,(use$xon)
+	or	a		; see if we should send XOFF
+	ret	z		; not jumpered, dont send XOFF
+	ld	a,013H		; send XOFF (^S) key to remote
+	call	outuart		; computer to stop xmission
+	ret
+
+
+; Turn on remote transmission (if possible)
+
+turn$on$xmit:
+
+	ld	a,(xoff$dtr)	; (13) is DTR high or XOFF sent?
+	or	a		; (4)
+	ret	z		; (12) no, continue processing input
+	xor	a
+	ld	(xoff$dtr),a	; turn off flag
+	ld	a,007H
+	out	(usart$stat),a	; set DTR/ low
+	ld	a,(use$xon)	; see if we should send XON
+	or	a
+	ret	z		; no, dont send XON
+	ld	a,011H		; send ^Q , XON protocol
+	call	outuart
+	ret
+
+
+; Process Keyboard Interrupt (depends what mode we are in)
+
+in$keybd:in	a,(keybd$data)	; grab data from keyboard
+	ld	c,a		; store away for later
+	ld	a,1
+	ld	(key$pressed),a	; Tell screen saver that keybd hit
+	ld	a,(keybd$locked)
+	cp	0
+	ret	nz		; ret. if keyboard locked out
+
+	ld	a,(setup$mode)	; in setup screen mode?
+	cp	0ffh
+	ld	a,c
+	jp	z,set$char	; go to setup screen mode code
+				; to process character
+
+	cp	01FH		; ^0, send break character?
+	jp	z,sndbrk	; yes, go set break bits
+
+	ld	a,(rem$loc)	; which mode are we in?
+	or	a
+	ld	a,c
+	jr	z,in$loc
+
+; (Note: The following code has been commented out. It use to
+; enter the setup screen when ESCxx was typed in the remote mode
+; but now does the same when Shift+Ctrl+ESC is pressed)
+
+.comment\
+; #################################################################
+; Remote mode, just recognize default screen commands 
+; ESCxx 
+
+; We do this by intercepting the escape level processing routines
+; of the LOCAL routine, and only put the escape sequence in
+; the buffer when it is declared not escxx 
+
+	ld	a,(int$esc)	; or we in interrupt escape seq?
+	cp	8
+	jr	c,anesc		; not a sub-interrupt esc sequence
+
+	cp	9
+	jr	z,third		; go check 3rd character
+
+; get 2nd character of the escape sequence but dont send to uart
+
+	ld	a,c
+	cp	'x'
+	jr	nz,tryX
+setx:	ld	a,9		; we are waiting for an x
+	ld	(int$esc),a
+	ret
+
+tryX:	cp	'X'
+	jr	z,setx
+
+yyb:	call	badesc
+	jr	nott2
+
+; get 3rd character of the sequence or else send the first
+; two characters to the buffer
+
+third:	ld	a,c
+	cp	'x'
+	jr	nz,third2
+third1:	ld	a,0f0h
+	ld	(mon$set$mode),a; set background mode flag
+	jr	badesc		; for setup screen
+
+third2:	cp	'X'
+	jr	z,third1
+	push	bc
+	ld	a,'x'		; print out delayed 2nd char
+	call	outuart
+	pop	bc
+
+; 3rd character was wrong, 
+
+allbad:	call	badesc
+	jr	nott2
+
+badesc:	xor	a
+	ld	(int$esc),a
+	ret
+
+anesc:	ld	a,c
+	cp	esc		; first escape sequence?
+	jr	nz,nott2	; not esc, stick send to uart
+	ld	a,8
+	ld	(int$esc),a	; say we are waiting for 2nd char
+\
+; #####################  End of commented out code  ######################
+
+	cp	0e0h		; Shift+Control+(Caps)+ESC ?
+	jr	nz, nott2	; Not setup screen key
+
+; User wants to enter the setup screen, so set a flag for the foreground
+; character processor to see and execute on.
+
+	ld	a,0f0h
+	ld	(mon$set$mode),a; set background mode flag
+	ret
+
+nott2:	ld	a,c		; Get original character back
+
+; now do the function key emulation. In the keyboard rom
+; the codes for SHIFT-CONTROL 1-8 have been mapped to
+; F0 thru F7h. The software then maps it to ESC + Character
+
+	cp	0ffh
+	ret	z		; undefined key
+	cp	0f0h
+	jr	c,nofunc	; not a function key
+	ld	a,esc
+	push	bc		; save character
+	call	outuart		; firt send escape sequence
+	pop	bc
+	ld	a,c
+	sub	0f0h		; make 0-7
+	cp	05h
+	jr	c,under$f5	; jump if f0h-f4h
+	sub	5
+	add	a,'P'
+	jr	nofunc
+
+under$f5:add	a,'S'
+
+nofunc:	call	outuart		; send char to uart
+	ret
+
+; local mode, send keybd data to buffer for 'LOCAL' routine
+; to decipher
+
+in$loc:	cp	080h		; Don't accept anything above 7fh
+	ret	nc
+	ld	hl,(newptr)	; get new buffer location
+	ld	(hl),a		; and store in interrupt buffer
+	inc	hl
+	ld	de,buftop	; at top yet?
+	call	cphlde
+	jr	nz,in3		; no, not at top	
+	ld	hl,charbuf	; wrap around	
+in3:	ld	de,(oldptr)
+	call	cphlde		; see if pointer collision
+	ret	z		; oops, dont update pointer
+	ld	(newptr),hl	; update oldptr
+	ret
+
+; Send break character string
+
+sndbrk:	ld	a,00FH		; set break bits of USART reg.
+	out	(usart$stat),a	; and tell USART to send break
+	ld	d,004H		; loop for 320ms (4*80ms)
+brkloop:call	delay		; wait 80ms
+	dec	d
+	jr	nz,brkloop	; continue loop
+	ld	a,007H
+	out	(usart$stat),a	; turn break mode off, DTR/ low
+	ret
+
+; ----------- Process Keyboard or Remote Commands ---------
+
+; this is called by the local keyboard if in local mode
+; or by the remote usart input if remote mode.
+
+; It decodes the escape level codes.
+
+local:	ld	c,a		; save input character
+	ld	a,(esc$level)
+	or	a
+	jp	z,cont$inpt	; jump if not ESC sequence
+
+; --> We are in the midst of an escape sequence....
+
+	cp	001H		; is this the 2nd character?
+	jr	nz,char3	; no, go see if 3rd character
+
+; --> This is the 2nd byte of the esc sequence - the command char.
+
+	ld	a,(emu$type)	; see if ADM32 or VT52
+	or	a
+	ld	a,c		; get character
+	jr	nz,do$adm
+
+	cp	vt$direct$curs$cmd ; is it 'Y' direct cursor addressing command?
+	jr	nz,try$one
+	jr	save1st
+
+do$adm:	cp	adm$direct$curs$cmd ; is it '=' direct cursor addressing command?
+	jr	nz,try$one
+
+; three parameter direct cursor positioning command
+
+save1st:ld	a,2		; say we are waiting for 2 more
+	ld	(esc$level),a	; characters
+	ret
+
+; Maybe it is command that requires no more data?
+
+try$one:ld	a,c
+	push	bc
+	ld	bc,one$param$length ; search for single command table
+	ld	hl,one$param$tbl
+	cpir			; look for entry in table
+	inc	bc
+	jr	z,one$command	; found character in table
+	pop	bc
+
+; Maybe it is command that requires one more data byte
+
+	ld	a,c		; get back character
+	push	bc
+	ld	bc,two$param$length ; search for single command table
+	ld	hl,two$param$tbl
+	cpir			; look for entry in table
+	inc	bc
+	ld	a,c
+	ld	(tbl$loc),a	; save for later
+	pop	bc		; get back character
+	jr	z,two$command	; found character in table
+
+; escape command not recognized, reset escape level
+
+rstesc:	ld	a,0
+	ld	(esc$level),a
+	ret			; and kill the character
+
+; the command requires no parameters, execute it
+
+one$command:
+	ld	a,one$param$length
+	sub	c		; make offset from START of parameter character table
+	pop	bc		; get char. off stack
+	ld	hl,one$param$addr ; get address of routines
+
+; (two params code enters here)
+
+exec$cmd:
+	push	af
+	xor	a
+	ld	(esc$level),a
+	pop	af
+	sla	a
+	ld	e,a
+	ld	d,0
+	add	hl,de		; get offset into table
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)		; get address
+	ex	de,hl
+	jp	(hl)
+
+; the command requires one parameter, tell wait for another one
+; The commands are 'x,y,r,t,s'
+
+two$command:
+	ld	a,3
+	ld	(esc$level),a
+	ret
+
+; escape command not recognized, kill the escape sequence flag
+
+rst$esc:xor	a		; reset ESCape sequence off.
+	ld	(esc$level),a
+	ret
+
+; --> Check for 3rd byte of escape sequence (the 1st parameter)
+
+char3:	cp	003H		; is 1st parameter expected?
+	jr	z,two$params	; yes, thats its for these commands
+	cp	02h		; waiting for line of cursor?
+	jr	nz,column	; no, look for column
+
+; this is the line parameter of the direct cursor positioning command
+
+	ld	a,c
+	ld	(esc$param1),a
+	ld	a,4		; say we want second parameter
+	ld	(esc$level),a
+	ret
+ 
+; we have the 1 and only parameter needed for 'x,y,r,t,s' commands
+
+two$params:
+	ld	a,c
+	ld	(esc$param1),a
+	ld	hl,tbl$loc	; get position of 'x,y,r,t,s' in table
+	ld	a,two$param$length
+	sub	(hl)
+	ld	hl,two$param$addr
+	jr	exec$cmd	; go get address and execute it
+
+; check for 4th byte of escape sequence (the 2nd parameter)
+
+column:	cp	004H		; Is column expected?
+	jr	nz,no$col	; no, return to level 0
+
+; this is the 2nd parameter (the column of the direct addressing command)
+
+	push	bc		; save the column character
+
+	ld	a,(esc$param1)	; get line offset
+	sub	020H		; make it binary
+	ld	b,a
+	ld	a,(num$rows)
+	ld	c,a
+	ld	a,(stat$line)
+	or	a
+	jr	z,no$stat1
+	inc	c		; inc total # of rows if stat line
+no$stat1:
+	ld	a,b		; get row number (0..)
+	cp	c		; see if line within range
+	jr	c,rowok
+	ld	a,(rownum)	; default to present row
+
+	ld	a,(stat$line)	; if status line on then default row
+	or	a		;   to status line row
+	ld	a,(rownum)
+	jr	z,rowok		; default to present row if no status line
+	ld	a,c		; else, default to status line
+	dec	a		; adjust for last line
+
+rowok:	ld	hl,00
+	cp	0
+	jr	z,row2		; if top of page, hl = 0, jump
+	ld	b,a		; get row
+	ld	de,(num$colms)	; get line offset
+row1:	add	hl,de
+	djnz	row1
+row2:	call	movcurs		; and move to the line
+
+	pop	bc		; get back column parameter
+	ld	a,c		; get col wanted
+	sub	020H		; make binary
+	ld	hl,num$colms
+	cp	(hl)
+	jr	c,colok
+	ld	a,(num$colms)	; default to last column of line
+	dec	a
+colok:	push	af
+	call	getcurs		; get current cursor offset
+	pop	af
+	ld	d,000H		; form offset
+	ld	e,a
+	add	hl,de		; and move the cursor
+	call	movcurs
+	jp	rst$esc
+
+; bad escape sequence (>3), so return to level 0
+
+no$col:	xor	a		; return to waiting for ESC
+	ld	(esc$level),a
+	ret
+
+; Continue processing input characters (not an escape sequence)
+
+cont$inpt:
+	ld	a,c
+	cp	07FH		; backspace?
+	jr	nz,not$bs	; see if a control code
+
+	call	cur$left	; move cursor left
+	call	getcurs
+	ld	de,(page$ptr)
+	add	hl,de		; HL = offset from start of video memory
+	ld	bc,1
+	call	erase		; erase the character
+	ret
+
+not$bs:	cp	020H		; a control character?
+	jp	m,key$jmp	; yes, go to screen routines
+
+; if in graphics mode, remap 60-7f to 0-1f
+
+	ld	a,(graf$mode)
+	or	a
+	jr	z,notg		; not graphics mode
+	ld	a,c
+	cp	5eh
+	jr	c,notg		; less than '^'
+	cp	7fh
+	jr	nc,notg		; >= than DEL
+	cp	7eh		; last graphic character?
+	jr	nz,not7e	; no, map others then
+	inc	a		; map 7eh --> 7fh
+	jr	sendg
+not7e:	sub	5eh		; make 0 - 1f
+sendg:	ld	c,a
+	ld	hl,cont4	; push return addr on stack
+	push	hl		; set up for entry into
+	push	bc		;  middle of 'video' routine
+	push	hl
+	jp	alt$video	; print graphic character
+				; but dont check for CR or LF!
+notg:	ld	a,c
+	call	video		; send character to video mem.
+
+cont4:	ld	hl,colmnum
+	ld	a,(num$colms)
+	dec	a
+	cp	(hl)
+	ret	nz
+	ld	a,(eoln$beep)
+	or	a
+	ret	z
+	call	cbell		; end of line beep
+	ret
+
+; Calculate keyboard subroutine corresponding to keyboard
+; input control character.
+
+key$jmp:push	af
+	ld	a,(rem$loc)	; but are we in remote mode?
+	or	a
+	jr	z,not$rem	; no, skip
+	pop	af
+
+; in remote mode, so interpret character as one of 6 control codes
+
+	cp	esc		; ESC
+	jp	z,cesc		; set sec flag if esc sequence start
+	cp	9		; ^I
+	jp	z,ctab
+	cp	13		; ^M - send send CR (no lf)
+	jp	z,cnewline
+	cp	10		; ^J - lf
+	jp	z,clf
+	cp	8		; ^H - bs
+	jp	z,cbs
+	cp	7		; ^G - bell
+	jp	z,cbell
+
+
+; check for ADM3A terminal emulation control codes
+
+	ld	c,a
+	ld	a,(emu$type)	; see if ADM3a emulation
+	or	a
+	jp	z,cnull		; VT52 - so not recognized
+	ld	a,c
+	cp	30		; ^^
+	jp	z,chome
+	cp	11		; ^K
+	jp	z,cupline
+	cp	12		; ^L
+	jp	z,curs$rite
+	cp	26		; ^Z
+	jp	z,clr$scn
+	jp	cnull		; character not recognized
+
+; in local mode, so interpret character as a control code
+
+not$rem:pop	af
+	sla	a		; key input * 2
+	ld	e,a		; form offset
+	ld	d,000H
+	ld	hl,loc$tbl	; point to local jmp table
+	add	hl,de		; point to pointer
+	ld	e,(hl)		; de points to keybd routine
+	inc	hl
+	ld	d,(hl)
+	ex	de,hl
+	jp	(hl)		; jump to keyboard function
+
+; -------------- Setup Screen Code -----------------------
+
+; Start status line mode, print status line & indicate mode
+
+; Printing of the screen is done in the foreground mode, all
+; keyin and mode changes are done in the background. The
+; keyboard interrupt jumps here if the SETUP$MODE flag is 0FFh.
+
+setup$screen:
+
+	ld	a,0ffh
+	ld	(setup$mode),a	; set foreground flag
+
+;	call	turn$off$xmit	; turn off remote sending since
+				; the setup screen is using the
+				; input buffer
+
+; clear the screen first so dont see input buffer garbage
+; when switch screens
+
+	ld	hl,screen3 + vid$mem
+	ld	bc,2000		; clear 24 * 80 screen
+	ld	e,' '
+clr3:	ld	(hl),e
+	inc	hl
+	dec	bc
+	ld	a,b
+	or	c
+	jr	nz,clr3
+
+
+	call	getcurs		; save current cursor location
+	ld	(cursloc),hl
+
+	ld	a,(atr$flag)	; turn off attribute flag
+	ld	(temp$atr),a	; save it
+	xor	a
+	ld	(atr$flag),a
+
+	ld	a,(screen$mode)
+	ld	(screen$save),a	; save it
+	ld	(orig$mode),a
+
+	ld	hl,(page$ptr)
+	ld	(page$save),hl	; save start of screen
+
+	ld	a,0
+	ld	(goto$screen1),a; flag for setup return to tell
+				; it to switch to screen 1 
+
+	ld	(screen$mode),a ; select 24 * 80 mode
+	ld	hl,screen3
+	call	pgm$6845	; make screen3
+	call	clr$scn		; clear the screen
+	call	prt$stat$scrn	; print out screen
+
+wait2:	ld	a,(setup$mode)	; wait for background to finish
+	cp	0ffh
+	jr	z,wait2
+	ret			; return to terminal mode
+
+
+; The keyboard interrupt vector will come here if in setup
+; screen mode so we can change the parameters..
+
+set$char:
+	cp	cr		; RETURN pressed?
+	jp	z,setup$ret	; yes, return then
+	cp	'z'+1
+	ret	nc
+	cp	'a'
+	jr	nc,lower
+	cp	'Z'+1
+	ret	nc
+	cp	'A'
+	ret	c
+	jr	char$check
+
+lower:	sub	020h		; make uppercase
+
+; see if the option picked is valid
+
+char$check:
+	cp	'A' + num$entries
+	ret	nc
+;	jr	nc,waitchar
+
+	sub	'A'		; make binary
+
+; next move cursor to the new parameter line and clear it
+
+	push	af
+	call	getcurs		; save cursor address
+	pop	af
+	push	hl
+	push	af
+
+	ld	hl,80 * 2 + 3	; start two lines down
+	ld	de,040		; move by half lines
+	ld	b,a		; get count
+	cp	0
+	jr	z,clearit
+mk:	add	hl,de
+	djnz	mk
+
+clearit:push	hl
+	call	movcurs
+	ld	b,037		; clear half line
+mk2:	ld	a,' '
+	call	video		; print space or reverse video
+	djnz	mk2
+	pop	hl
+	call	movcurs		; move cursor to start of entry
+
+; now reprint entry and call parameter modification section
+
+	pop	af
+	ld	b,a
+	sla	a		; make word
+	add	a,b		; * 3
+	sla	a		; * 6
+	ld	hl,setup$fix
+	push	hl		; push return on stack
+
+; now find address of parameter toggle routine in table
+; and execute it.
+
+	ld	hl,stat$tbl	
+	ld	e,a
+	ld	d,0
+	add	hl,de		; make offset into table
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)
+	inc	hl
+	ex	de,hl
+	call	prtstr		; print parameter title
+	ex	de,hl
+	ld	c,(hl)
+	inc	hl
+	ld	b,(hl)		; BC = parameter print routine
+	inc	hl
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)		; get parameter modification address	
+	ex	de,hl
+	push	bc
+	pop	de		; get addr of modification routine
+	jp	(hl)		; jump to change routine
+
+; modification routines return here.
+
+setup$fix:
+	ld	hl,setup$fix2
+	push	hl		; put return address on stack
+	ex	de,hl
+	jp	(hl)		; print new parameter
+
+setup$fix2:
+	call	prgm$io
+	pop	hl		; get old cursor address
+	call	movcurs
+	ret
+;	jr	waitchar
+
+setup$ret:
+	xor	a
+	ld	(setup$mode),a	; cancel setup mode
+	ld	a,(temp$atr)	; reset attribute flag
+	ld	(atr$flag),a	;   back to normal..
+
+; if in local mode now then always default to 80*24 w/o status line!
+
+	ld	a,(rem$loc)
+	or	a
+	ld	a,(screen$save)	; not local, keep original mode
+	jr	nz,upd	
+	xor	a		; local mode, default to 80*24, w/o status line
+upd:	ld	(screen$mode),a
+	ld	hl,(page$save)	; point to old screen
+	call	pgm$6845	; reprogram screen
+
+; if subroutines want us to change to screen 1 then change here
+
+	ld	a,(goto$screen1)
+	or	a
+	jr	z,dontgo
+
+	ld	a,0
+	ld	(screen$num),a
+	ld	hl,screen1
+	call	updat$vm
+	ld	hl,0		; home cursor
+	call	movcurs
+	ld	hl,0
+	ld	(alt$curs),hl	; reset screen 2's cursor location
+	ld	(cursloc),hl
+	xor	a
+	ld	(goto$screen1),a
+
+; clear the screen if we changed video modes
+
+dontgo:	ld	a,(screen$mode)
+	ld	hl,orig$mode	; point to original screen mode
+	cp	(hl)
+	jr	z,md3
+	call	clear$stat$line	; clear status line if there is one
+	call	clr2$scn	; go clear the screen
+
+md3:	ld	hl,(cursloc)	; move cursor back to old location
+	call	movcurs
+	ld	hl,charbuf	; reset the input buffer
+	ld	(newptr),hl	; (the setup screen killed it)
+	ld	(oldptr),hl
+;	call	turn$on$xmit	; turn on remote sending again
+	ret			; return to background process
+
+; print out setup screen
+
+prt$stat$scrn:
+	ld	hl,main$title	; print out title
+	call	prtstr
+	ld	de,stat$tbl	; point to title addresses
+	ld	b,num$entries	; loop for this many entries
+	ld	a,'A'		; start at A
+scn$loop:
+	push	de
+	call	video		; print option number (A,B...)
+	pop	de
+	inc	a
+	push	af		; save it
+	ld	a,')'
+	push	de
+	call	video
+	ld	a,' '
+	call	video
+	pop	de
+	call	getcurs		; save original cursor location
+	push	hl
+	ex	de,hl		; HL = table address
+	ld	e,(hl)		; get string address
+	inc	hl
+	ld	d,(hl)
+	inc	hl	
+	ex	de,hl
+	call	prtstr		; print out sub title
+	ex	de,hl
+	ld	e,(hl)		; get parameter printout routine
+	inc	hl		;   address
+	ld	d,(hl)
+	inc	hl
+	inc	hl		; inc to next entry
+	inc	hl
+	ex	de,hl
+	push	bc		; save count
+	push	de		; save next table address
+	ld	de,scn$ret
+	push	de		; push return on stack
+	jp	(hl)		; go print out value of parameter
+	
+scn$ret:pop	de		; get next table address
+	pop	bc		; get count
+	pop	hl		; get original screen location
+	push	bc		; save it
+	ld	bc,37		; move cursor 1/2 line
+	add	hl,bc
+	pop	bc		; restore it
+	call	movcurs		; move cursor to new location
+	pop	af		; get back next option number
+	djnz	scn$loop	; and print rest of screen
+	ld	hl,option$ttl
+	call	prtstr
+	ret			; return to setup controller
+
+; -------- Parameter status printout subroutines ------------
+
+rem$prt:ld	a,(rem$loc)
+	or	a
+	ld	hl,rem$str
+	jr	nz,not$loc	; jump if remote mode
+	ld	hl,loc$str
+not$loc:jp	prtstr		; print REMote/local mode
+
+norm$prt:
+	ld	a,(rev$nor)
+	or	a
+	ld	hl,inv$str
+	jr	nz,not$std
+	ld	hl,norm$str
+not$std:jp	prtstr		; print REV/STD Screen
+
+attr$prt:
+	ld	a,(atrtype)
+	or	a
+	ld	hl,attr0$str
+	jr	z,not$off
+	cp	001H
+	ld	hl,attr1$str
+	jr	z,not$off
+	cp	002H
+	ld	hl,attr2$str
+	jr	z,not$off
+	ld	hl,attr3$str
+not$off:jp	prtstr		; print type of attribute
+
+; Cursor on/off
+
+curs1$prt:
+	ld	a,(curs$start)	; get Register 10 data
+	and	60h
+	ld	hl,off$str	; no cursor display
+	cp	20h
+	jr	z,prt$crs
+	ld	hl,on$str
+	jr	prt$crs
+
+; cursor blink/no blink
+
+curs2$prt:
+	ld	a,(blink)
+	ld	hl,on$str
+	cp	0ffh
+	jr	z,snd$blk	; blinking on, so print it
+	ld	hl,off$str
+snd$blk:jp	prtstr
+
+; Cursor block/underscore
+
+curs3$prt:
+	ld	a,(curs$start)
+	and	1fh		; get cursor start address
+	ld	hl,block$str
+	cp	2		; if <2 then block cursor
+	jr	c,prt$crs
+	ld	hl,under$str	; underscore cursor
+prt$crs:jp	prtstr
+
+; Print size of the screen
+
+screen$prt:
+	ld	a,(screen$save)
+	ld	b,a
+	ld	a,(stat$line)
+	cp	0h
+	jr	z,no$dec
+	dec	b		; kill status line
+no$dec:	ld	a,b
+	srl	a		; kill status line modes
+	ld	hl,screen$type
+	ld	b,a
+	cp	0
+	jr	z,sc3
+sc2:	ld	de,23
+	add	hl,de
+	djnz	sc2
+sc3:	jp	prtstr		; print screen mode
+
+scrnnum$prt:
+	ld	a,(screen$num)
+	add	a,'1'		; make 0 or 1
+	call	video
+	ret
+
+wrap$prt:
+	ld	a,(wrap$around)
+	or	a
+	ld	hl,off$str
+	jr	z,no$wrap
+	ld	hl,on$str
+no$wrap:jp	prtstr
+
+sndlf$prt:
+	ld	a,(send$lf)
+	or	a
+	ld	hl,off$str
+	jr	z,no$lf
+	ld	hl,on$str
+no$lf:	jp	prtstr
+
+sndcr$prt:
+	ld	a,(send$cr$flg)
+	or	a
+	ld	hl,off$str
+	jr	z,no$cr
+	ld	hl,on$str
+no$cr:	jp	prtstr
+
+beep$prt:
+	ld	a,(eoln$beep)
+	or	a
+	ld	hl,off$str
+	jr	z,no$bep
+	ld	hl,on$str
+no$bep:	jp	prtstr
+
+baud$prt:
+	ld	a,(baudrate)
+	ld	hl,baud$str	; point to baudrate strings
+	sla	a
+	sla	a
+	sla	a		; * 8
+	ld	d,000H
+	ld	e,a
+	add	hl,de
+	jp	prtstr
+
+data$prt:
+	ld	a,(databits)
+	or	a
+	ld	hl,data7$str
+	jr	z,not$0
+	ld	hl,data8$str
+not$0:	jp	prtstr		; print number of data bits
+
+parity$prt:
+	ld	a,(parity)
+	or	a
+	ld	hl,none$str
+	jr	z,no$par
+	cp	001H
+	ld	hl,odd$str
+	jr	z,no$par
+	ld	hl,even$str
+no$par:	jp	prtstr		; print type of parity
+
+stop$prt:
+	ld	a,(stopbits)
+	or	a
+	ld	hl,stop1$str
+	jr	z,stop$1
+	ld	hl,stop2$str
+stop$1:	jp	prtstr		; print number of stop bits
+
+save$prt:
+	ld	a,(saver)
+	or	a
+	ld	hl,off$str
+	jr	z,no$save
+	ld	hl,on$str
+no$save:jp	prtstr		; print status of screen save mode
+
+xon$prt:
+	ld	a,(use$xon)
+	or	a
+	ld	hl,off$str
+	jr	z,no$xon
+	ld	hl,on$str
+no$xon: jp	prtstr		; print status of xon/xoff protocol
+
+emu$prt:ld	a,(emu$type)	; print emulation type
+	and	1
+	ld	hl,vt52$str
+	jr	z,vtmode
+	ld	hl,adm3a$str
+vtmode:	jp	prtstr
+
+buff$prt:
+	ld	a,(buff$percent) ; 1-10
+	dec	a
+	sla	a
+	sla	a
+	ld	e,a
+	ld	d,0
+	ld	hl,buff$tbl
+	add	hl,de
+	jp	prtstr
+
+; print screen saver timeout (10,20, 28 minutes)
+
+time$prt:
+	ld	a,(timeout)
+	cp	10
+	jr	nz,not10
+	ld	hl,min10
+	jr	prtmin
+
+not10:	cp	20
+	jr	nz,not20
+	ld	hl,min20
+	jr	prtmin
+
+not20:	ld	hl,min28	
+	
+prtmin:	jp	prtstr
+
+
+; ---------- Parameter modification subroutines ------------
+
+;   ***** DE MUST NOT BE DESTROYED WHEN RETURNING *****
+
+; Toggle A between 0 and 0ffh
+
+toggle:	or	a
+	ld	a,0ffH
+	ret	z
+	xor	a
+	ret
+
+save$chng:			; toggle screen save mode
+	ld	a,(saver)
+	call	toggle
+	ld	(saver),a
+	ret
+
+rem$chng:
+	ld	a,1		; tell setup return to select
+	ld	(goto$screen1),a ; 1st screen
+	ld	a,(rem$loc)
+	call	toggle
+	ld	(rem$loc),a
+	or	a
+	ret	nz		; return if remote mode
+
+; for local mode kill the UART input buffer so no data
+; gets processed & set screen mode to 80*24 & select screen 1
+
+	xor	a
+	ld	(screen$save),a
+	ld	(newptr),a
+	ld	(oldptr),a
+	ret
+
+norm$chng:    
+	ld	a,(rev$nor)
+	call	toggle
+	ld	(rev$nor),a
+	ret
+
+attr$chng:    
+	ld	a,(atrtype)
+	inc	a
+	and	003H
+	ld	(atrtype),a
+	ret
+
+; cursor on/off
+
+curs1$chng:    
+	ld	a,(curs$start)
+	and	060h
+	cp	20h		; cursor off?
+	jr	nz,notoff
+	call	cursor$on	; turn on the cursor
+	ret
+notoff:	call	cursor$off
+	ret
+
+; cursor blink/no blink
+
+curs2$chng:
+	ld	a,(blink)
+	cp	0ffh
+	jr	z,off$blnk
+	call	blink$cursor
+	ret
+off$blnk:
+	call	no$blink
+	ret
+
+; cursor block/underscore
+
+curs3$chng:
+	ld	a,(curs$start)
+	and	1fh
+	cp	2
+	jr	nc,un$cur	; block now, change to underscore
+	call	under$cursor 	
+	ret
+un$cur:	call	block$cursor	; change to block cursor
+	ret
+
+screen$chng:  
+	ld	a,(rem$loc)
+	or	a
+	jr	nz,scr1		; jump if remote mode
+	xor	a		; if local mode, default video
+	jr	notend		; to 80*24
+
+scr1:	ld	hl,0000
+	ld	(cursloc),hl	; home cursor
+	ld	a,(screen$save)	; preserve status line mode
+	inc	a		; if it is still on
+	inc	a
+	cp	6h
+	jr	nz,nt1
+	ld	a,0
+	jr	notend
+
+nt1:	cp	7h
+	jr	nz,notend
+	ld	a,1		; in case we had status line on
+
+notend:	ld	(screen$save),a
+	cp	2		; are we in 40*96 mode?
+	jr	z,flip		; yes
+	cp	3
+	ret	nz		; no, return
+flip:	ld	a,1		; tell setup return to select
+	ld	(goto$screen1),a ; 1st screen
+	ret
+
+scrnnum$chng: 
+	ld	a,(screen$save)	; get screen mode we are in
+	cp	2		; dont allow changing to screen2
+	ret	z		; if in 40*96 mode (just 1 screen)
+	cp	3
+	ret	z
+
+	ld	a,(rem$loc)	; don't allow changing screens
+	or	a		;  in the local mode
+	ret	z		; return if local mode
+	ld	a,(screen$num)
+	cp	0		; 1st screen?
+	ld	a,0
+	ld	hl,screen1	; point to screen 1
+	jr	nz,go$1st	; no, goto 1st then
+	ld	a,1		; select 2nd screen
+	ld	hl,screen2	; point to screen 2
+go$1st: ld	(screen$num),a
+	ld	(page$save),hl	; update page pointer
+	ld	hl,(cursloc)	; get old cursor location
+	push	hl
+	ld	hl,(alt$curs)	; switch screen's cursor locations
+	ld	(cursloc),hl	; with each other
+	pop	hl
+	ld	(alt$curs),hl	; and store old cursor location away
+	ret
+
+wrap$chng:    
+	ld	a,(wrap$around)
+	call	toggle
+	ld	(wrap$around),a
+	ret
+
+sndlf$chng:   
+	ld	a,(send$lf)
+	call	toggle
+	ld	(send$lf),a
+	ret
+
+sndcr$chng:  
+	ld	a,(send$cr$flg)
+	call	toggle
+	ld	(send$cr$flg),a
+	ret
+
+beep$chng:    
+	ld	a,(eoln$beep)
+	call	toggle
+	ld	(eoln$beep),a
+	ret
+
+baud$chng:    
+	ld	a,(baudrate)
+	inc	a
+	cp	0fH		; accept only 0-14
+	jp	m,ok$baud	; ok, jump
+	xor	a		; wrap around to 0
+ok$baud:ld	(baudrate),a
+	ret
+
+data$chng:    
+	ld	a,(databits)
+	cp	0
+	jr	z,ch1
+	xor	a
+	ld	(databits),a
+	ret
+
+ch1:	ld	a,1
+	ld	(databits),a
+	ret
+
+parity$chng:  
+	ld	a,(parity)
+	inc	a
+	cp	002H
+	jr	nz,ok$party
+	inc	a
+ok$party:and	003H		; <<-- neat label huh?
+	ld	(parity),a
+	ret
+
+stop$chng:    
+	ld	a,(stopbits)
+	call	toggle
+	and	01		; keep only lower bit
+	ld	(stopbits),a
+	ret
+
+xon$chng:
+	ld	a,(use$xon)	; toggle Xon/Xoff handshaking
+	call	toggle
+	ld	(use$xon),a
+	ret
+
+emu$chng:
+	ld	a,(emu$type)	; 0 or 1
+	inc	a
+	and	1
+	ld	(emu$type),a
+	ret
+
+buff$chng:
+	ld	a,(buff$percent)
+	inc	a
+	cp	11
+	jr	c,buffok
+	ld	a,1
+buffok: ld	(buff$percent),a
+	ret
+
+; change the screen saver timeout
+
+time$chng:
+	ld	a,(timeout)
+	cp	10
+	jr	nz,not10m
+	ld	a,20
+	jr	chngmin
+
+not10m:	cp	20
+	jr	nz,not20m
+	ld	a,28
+	jr	chngmin
+
+not20m:	ld	a,10
+	
+chngmin:ld	(timeout),a
+
+; now update loop count 
+
+	ld	hl,timeout	; get screen saver timeout
+	ld	b,9
+	ld	a,0
+mult:	add	a,(hl)		; 9 * screen saver timeout
+	djnz	mult
+	ld	(timeout$clks),a ; save it 
+	ret
+
+; -------  Setup Screen Dispatch Tables and Strings  --------
+
+; Table entries are:
+
+;	main title string addr,parameter printout routine
+;	modification routine.
+	
+
+stat$tbl:
+	defw	rem$ttl,      rem$prt,     rem$chng
+	defw	norm$ttl,     norm$prt,    norm$chng
+	defw	attr$ttl,     attr$prt,    attr$chng
+	defw	curs1$ttl,    curs1$prt,   curs1$chng
+	defw	curs2$ttl,    curs2$prt,   curs2$chng
+	defw	curs3$ttl,    curs3$prt,   curs3$chng
+	defw	screen$ttl,   screen$prt,  screen$chng
+	defw	scrnnum$ttl,  scrnnum$prt, scrnnum$chng
+	defw	wrap$ttl,     wrap$prt,    wrap$chng
+	defw	sndlf$ttl,    sndlf$prt,   sndlf$chng
+	defw	sndcr$ttl,    sndcr$prt,   sndcr$chng
+	defw	beep$ttl,     beep$prt,    beep$chng
+	defw	baud$ttl,     baud$prt,    baud$chng
+	defw	data$ttl,     data$prt,    data$chng
+	defw	parity$ttl,   parity$prt,  parity$chng
+	defw	stop$ttl,     stop$prt,    stop$chng    
+	defw	save$ttl,     save$prt,    save$chng
+	defw	time$ttl,     time$prt,    time$chng
+	defw	xon$ttl,      xon$prt,     xon$chng
+	defw	emu$ttl,      emu$prt,     emu$chng
+	defw    buff$ttl,     buff$prt,    buff$chng
+
+num$entries equ	($ - stat$tbl)/6
+
+on$str:		db	'On',0
+off$str:	db	'Off',0
+
+rem$str:	db	'Remote',0
+loc$str:	db	'Local',0
+
+block$str:	db	'Block',0
+under$str:	db	'Underscore',0
+
+screen1$str:	db	'1st',0
+screen2$str:	db	'2nd',0
+
+norm$str:	db	'Normal',0
+inv$str:	db	'Inverse',0
+
+attr0$str:	db	'None',0
+attr1$str:	db	'Dim',0
+attr2$str:	db	'Inverse',0
+attr3$str:	db	'Alt. char set',0
+
+vt52$str:	db	'VT 52',0
+adm3a$str:	db	'ADM 3A',0
+
+; Screen saver timeout values (in minutes)
+
+min10:	db	'10',0
+min20:	db	'20',0
+min28:	db	'28',0
+
+; Input buffer percentages before sending XOFF
+
+buff$tbl:
+	db	'10%',0
+	db	'20%',0
+	db	'30%',0
+	db	'40%',0
+	db	'50%',0
+	db	'60%',0
+	db	'70%',0
+	db	'80%',0
+	db	'90%',0	
+	db	'100',0
+
+screen$type:
+	db	'80*24, 15750 hz, 60 hz',0
+	db	'96*40, 15750 hz, 60 hz',0
+	db	'96*24, 15750 hz, 60 hz',0
+
+baud$str:
+	db	' 50    ',0
+	db	' 75    ',0
+	db	' 110   ',0
+	db	' 134.5 ',0
+	db	' 150   ',0
+	db	' 300   ',0
+	db	' 600   ',0
+	db	' 1200  ',0
+	db	' 1800  ',0
+	db	' 2000  ',0
+	db	' 2400  ',0
+	db	' 3600  ',0
+	db	' 4800  ',0
+	db	' 7200  ',0
+	db	' 9600  ',0
+	db	'[19200]',0
+
+data7$str:	db	'7',0
+data8$str:	db	'8',0
+
+odd$str:	db	'Odd',0
+even$str:	db	'Even',0
+none$str:	db	'None',0
+
+stop1$str:	db	'1',0
+stop2$str:	db	'2',0
+
+; Main titles:
+
+main$title:	defb	'                          S E T  -  U P   S C R E E N',CR,CR,0
+
+option$ttl:	defb	cr,cr,'Please select a parameter or RETURN to exit. ',0
+
+rem$ttl:	defb	'Remote/Local mode: ',0
+norm$ttl:	defb	'Normal/Inverse Video: ',0
+attr$ttl:	defb	'Attribute type: ',0
+curs1$ttl:	defb	'Cursor : ',0
+curs2$ttl:	defb	'Cursor blink: ',0
+curs3$ttl:	defb	'Cursor type: ',0
+screen$ttl:	defb	'Screen size: ',0
+scrnnum$ttl:	defb	'Screen # (remote mode only): ',0
+wrap$ttl:	defb	'Wrap around: ',0
+sndlf$ttl:	defb	'Send LF after CR: ',0
+sndcr$ttl:	defb	'Send CR after LF: ',0
+beep$ttl:	defb	'End of line beep: ',0
+baud$ttl:	defb	'Baudrate: ',0
+data$ttl:	defb	'Data bits: ',0
+parity$ttl:	defb	'Parity: ',0
+stop$ttl:   	defb	'Stop bits: ',0
+save$ttl:	defb	'Screen saver: ',0
+time$ttl:	defb	'Screen saver timeout (min): ',0
+xon$ttl:	defb	'Xon/Xoff handshaking: ',0
+emu$ttl:	defb	'Emulation type: ',0
+buff$ttl:	defb	'% buffer full before XOFF: ',0
+
+; --------  local mode jump table pointers ----------------
+
+; this has been preprogrammed to give Wordstar like editing
+
+loc$tbl:defw	cnull		; ^@
+	defw	cnull		; ^A
+	defw	cstpatr		; ^B
+	defw	cnxtpg		; ^C
+	defw	curs$rite	; ^D
+	defw	cupline		; ^E
+	defw	cmoveol		; ^F
+	defw	cbell		; ^G
+	defw	cbs		; ^H
+	defw	ctab		; ^I
+	defw	clf		; ^J
+	defw	cnull		; ^K
+	defw	cclrscrn	; ^L
+	defw	cnewline	; ^M
+	defw	cnull		; ^N
+	defw	cnull		; ^O
+	defw	cnull		; ^P
+	defw	chome2		; ^Q
+	defw	cprpge		; ^R
+	defw	cbs		; ^S
+	defw	txbuff		; ^T
+	defw	cnull		; ^U
+	defw	csrtatr		; ^V
+	defw	cscrdwn		; ^W
+	defw	clf		; ^X
+	defw	cnull		; ^Y
+	defw	cscrup		; ^Z
+	defw	cesc		; esc
+	defw	cnull		; ^ 
+	defw	cnull		; ^ 
+	defw	cnull		; ^^
+	defw	cnull		; ^ 
+
+; --------------- local mode video routines ----------------
+
+; Clear ALL of the video memory (the editing buffer = all video memory)
+
+cclrscrn:call	init$scr	; clear screen, offsets =0
+	 ret			; and first video page
+
+; Home the cursor (and move start of screen to start of video mem)
+
+chome2:	ld	hl,00		; set cursor offset to 0
+	call	updat$vm	; and update curs memory loc
+	call	movcurs		; move the cursor
+	ret
+
+; Flip display to the next page
+
+; Each page is 16 lines long so pages overlap
+
+cnxtpg:	ld	hl,(page$ptr)	; get page offset
+	ld	de,0500H	; flip 1 page
+nxpage1:add	hl,de		; and make new offset
+	push	hl		; save new page pointer
+	ld	de,77fh
+	add	hl,de		; offset to end of this page
+	ex	de,hl
+	ld	hl,013ffH	; are we at the last page?
+	or	a
+	sbc	hl,de
+	pop	hl
+	jr	nc,not$last	; no, not last page..
+	ld	hl,0c80h	; set offset to last page
+not$last:push	hl
+	call	getcurs		; get current cursor offset
+	ex	de,hl		; and store in DE
+	pop	hl
+	call	updat$vm	; update 6845 video start addr.
+	ex	de,hl
+	call	movcurs		; move to new offset using same
+	ret			; offset from start of screen but
+				; new vm pointer
+
+; Flip display to the previous page
+
+cprpge:	ld	hl,(page$ptr)	; get page offset
+	ld	de,0500H	; and move back one page
+prpage1:or	a
+	sbc	hl,de
+	jr	nc,prpage2	; jump if not first page
+	ld	hl,00		; set offset to first page
+prpage2:push	hl
+	call	getcurs		; get current cursor offset
+	ex	de,hl
+	pop	hl
+	call	updat$vm	; update 6845 start video addr.
+	ex	de,hl
+	call	movcurs		; move cursor to same offset as
+	ret			; the last screen
+
+; Scroll the screen down (soft scroll)
+
+cscrdwn:ld	hl,(page$ptr)	; get page offset
+	ld	de,(num$colms)	; move up one line
+	jr	prpage1
+
+; Scroll the screen up (soft scroll)
+
+cscrup:	ld	hl,(page$ptr)	; get page offset
+	ld	de,(num$colms)	; move down one line
+	jr	nxpage1
+
+; Transmit the buffer
+
+txbuff:	call	chome2		; home the cursor
+	ld	c,64 		; transmit 64 lines
+snd$rst:push	bc		; save count
+	call	snd$byte
+	pop	bc		; get count back
+	in	a,(keybd$stat)	; keyboard data waiting?
+	and	001H
+	jr	z,no$brk	; no, continue
+	in	a,(keybd$data)	; get data
+	cp	001H		; ^@ ?
+	ret	Z		; yes, return then
+no$brk:	dec	C		; dec. the line count
+	jr	nz,snd$rst	; send rest of the 64 lines
+	ret
+
+; send 1 line of video memory to the USART, check for keybd.
+
+snd$byte:call	curs$mem	; get cursor memory location
+	push	hl		; save it
+	call	cmoveol		; move cursor to end of line
+	call	curs$mem	; get new cursor mem location
+	pop	de		; get original cursor location
+	or	a
+	sbc	hl,de
+	jr	z,blank		; jump if the line is blank
+	ld	b,L
+	ex	de,hl
+snd$l2: ld	a,(hl)		; get the data
+	and	07fh		; strip off attribute
+	call	outuart		; send to the usart
+	inc	hl		; inc. to next video location
+	djnz	snd$l2		; continue sending line
+blank:	ld	a,00DH		; send CR/LF if the line is
+	call	outuart		; blank
+	ld	a,00AH
+	call	outuart
+	call	cnewline	; move cursor down 1 line
+	ret
+
+; Move to end of current line (end of text, start of spaces)
+
+cmoveol:call	srt$line	; get current line into B
+	call	getcurs		; get current cursor location
+	ld	de,(num$colms)	; move to end of line
+	dec	de
+	add	hl,de
+	call	movcurs		; and move cursor to end
+	call	curs$mem	; get cursor memory location
+	ld	bc,(num$colms)
+	ld	a,020H
+del1:	cpd			; delete compare until some-
+	jp	po,done$del	;  other than spaces are found
+	jr	z,del1		; loop till b=0 or <> space
+	inc	hl		; inc to first blank space
+done$del:inc	hl		; and inc for cursor location
+	call	movcurs		; and move cursor back
+	ret
+
+; -------- Remote mode ESCape jump table pointers  --------
+
+; Command addresses for one byte commands
+
+one$param$addr:
+	defw	cupline      	; A - up cursor 
+	defw	curs$dwn	; B - down cursor
+	defw	curs$rite      	; C - right cursor
+	defw	cur$left	; D - left cursor
+	defw	clr$scn		; E - clear display
+	defw	graf$on		; F - enter graphics mode
+	defw	graf$off	; G - exit graphics mode
+	defw	chome		; H - home cursor
+	defw	rev$lf		; I - reverse line feed
+	defw	eras$end	; J - erase to end of screen
+	defw	eras$right	; K - erase right (to eoln)
+	defw	ins$line	; L - insert line
+	defw	del$line	; M - delete line
+	defw	del$char	; N - delete character
+	defw	insert$off	; O - insert char. mode off
+	defw	eras$top	; b - erase to top
+	defw	cnull		; f - alternate character set
+	defw	cnull		; g - normal character set
+	defw	save$curs	; j - save cursor position
+	defw	recall$curs	; k - recall cursor position
+	defw	eras$line	; l - erase line
+	defw	read$curs	; n - read cursor address
+	defw	eras$left	; o - erase left
+	defw	csrtatr		; p - reverse video
+	defw	cstpatr		; q - normal video
+	defw	wrap$on		; v - wrap around on
+	defw	wrap$off	; w - wrap around off
+	defw	init$switches	; z - reset switches to power on state
+	defw	insert$on	; @ - insert character mode
+	defw	dis$keybd	; } - disable keyboard
+	defw	en$keybd	; { - enable keyboard
+	defw	trans$stat	; ] - transmit status line
+	defw	trans$page	; # - transmit page
+	defw	identify	; Z - identify terminal
+
+; Addresses of one data byte parameter commands
+
+two$param$addr:
+	defw	set$baud	; r - set baud rate
+	defw	set$crtc$mode	; s - set CRTC mode
+	defw	test$mode	; t - Test mode
+	defw	set$mode	; x - set mode controls
+	defw	reset$mode	; y - reset mode controls
+	defw	set$mode	; x - set mode controls
+
+; this lists the legal escape sequences, the 'LOCAL' routine
+; can determine if the command needs 1 or 2 paramters
+; by its position in the table.  Note the 'Y' command is
+; decoded directly in the 'LOCAL' routine (needs 3 parameters)
+
+vt$direct$curs$cmd equ	'Y'	; three paramter command 
+				; for direct cursor positioning
+
+adm$direct$curs$cmd equ	'='	; three paramter command 
+				; for direct cursor positioning
+
+one$param$tbl:
+
+	defb	'A' 		; - up cursor 
+	defb	'B' 		; - down cursor
+	defb	'C' 		; - right cursor
+	defb	'D' 		; - left cursor
+	defb	'E' 		; - clear display
+	defb	'F' 		; - enter graphics mode
+	defb	'G' 		; - exit graphics mode
+	defb	'H' 		; - home cursor
+	defb	'I' 		; - reverse line feed
+	defb	'J' 		; - erase to end of screen
+	defb	'K' 		; - erase right (to eoln)
+	defb	'L' 		; - insert line
+	defb	'M' 		; - delete line
+	defb	'N' 		; - delete character
+	defb	'O' 		; - insert char. mode off
+	defb	'b' 		; - erase to top
+	defb	'f' 		; - alternate character set
+	defb	'g' 		; - normal character set
+	defb	'j' 		; - save cursor position
+	defb	'k' 		; - recall cursor position
+	defb	'l' 		; - erase line
+	defb	'n' 		; - read cursor address
+	defb	'o' 		; - erase left
+	defb	'p' 		; - reverse video
+	defb	'q' 		; - normal video
+	defb	'v' 		; - wrap around on
+	defb	'w' 		; - wrap around off
+	defb	'z' 		; - reset to power on state
+	defb	'@' 		; - insert character mode
+	defb	'}' 		; - disable keyboard
+	defb	'{' 		; - enable keyboard
+	defb	']'		; - transmit status line
+	defb	'#'		; - transmit page
+	defb	'Z'		; - identify terminal
+
+one$param$length equ	$ - one$param$tbl
+
+	; two parameters table
+
+two$param$tbl:
+
+	defb	'r'		; - set baud rate
+	defb	's' 		; - set CRTC mode
+	defb	't' 		; - Test mode
+	defb	'x' 		; - set mode controls
+	defb	'y' 		; - reset mode controls
+	defb	'X'		; - set mode controls
+
+two$param$length equ	$ - two$param$tbl
+
+; ---------------- Page and Status line transmit -----------
+
+; transmit status line
+
+trans$stat:
+	ld	a,(stat$line)
+	or	a
+	jr	nz,trans2
+	ld	a,cr		; just send CR if no status line
+	jp	outuart
+
+trans2:	ld	hl,(page$size)
+	ld	de,(page$ptr)
+	add	hl,de
+	ld	de,vid$mem
+	add	hl,de
+	ld	a,(num$colms)
+	ld	b,a
+	ld	c,0	
+trans3:	call	send$1char	; send next character
+	djnz	trans3		; continue sending line
+	ld	a,cr		; send closing sequence
+	call	outuart
+	ret
+
+; transmit current video page
+
+trans$page:
+	ld	hl,(page$ptr)
+	ld	de,vid$mem
+	add	hl,de
+	ld	de,(page$size)
+	ld	c,0		; reset bit flags
+loop:	call	send$1char
+	dec	de
+	ld	a,e
+	or	d
+	jr	nz,loop
+	ld	a,cr		; send end sequence
+	call	outuart
+	ld	a,bell
+	call	outuart
+	ret
+
+; send 1 character of video memory to the USART. Decode
+; graphic mode and attributes at the same time.
+
+; Register C: bit 0 = NZ if presently in attribute mode
+;                 1 = NZ if presently in graphic mode
+
+; These 'modes' mean we dissaseemble the screen via reverse
+; escape sequences that once made the screen.
+
+send$1char:
+	ld	a,(hl)		; get the data
+	bit	7,a		; attribute on?
+	jr	z,noattr	; no, skip & try graphic mode
+	bit	0,c		; already sent graphic attribute sequence?
+	jr	nz,trygrap	; yes, dont resend it
+	ld	a,esc
+	call	snduart
+	ld	a,'p'		; Reverse video switch
+	call	snduart
+	set	0,c		; say in video mode
+	jr	trygrap		; go check for graphics
+
+noattr:	bit	0,c		; should we turn off attribute mode?
+	jr	z,trygrap	; not on, dont worry
+	res	0,c
+	ld	a,esc
+	call	snduart
+	ld	a,'q'		; send normal video mode
+	call	snduart
+
+
+trygrap:ld	a,(hl)		; get char again
+	and	07fh		; strip off attribute
+	cp	07fh		; possible graphic character
+	jr	z,gracharr
+
+	cp	1fh + 1		; 0-1f are graphic characters
+	jr	nc,notgrac	; not a graphic character
+
+; Character is a graphic character at this point
+
+gracharr:pop	af
+	bit	1,c		; sent escape sequence?
+	jr	nz,allgra	; yes, dont resend
+	push	af
+	ld	a,esc
+	call	snduart
+	ld	a,'F'		; enter graphics mode
+	call	snduart
+	set	1,c
+	pop	af
+
+; now untranslate the video characters
+
+allgra: cp	7fh
+	jr	nz,not7fh
+	dec	a		; tranlate 7fh to 7eh
+	jr	notg2		; and send it
+
+; has to be 0-1f
+
+not7fh:	add	a,5eh		; translate to lower case letters
+	jr	notg2		; and send it
+
+notgrac:bit	1,c		; coming out of a graphic sequence?
+	jr	z,notg1		; no, skip
+	ld	a,esc		; else, turn off graphics mode
+	call	snduart
+	ld	a,'G'		; send ENG GRAPHIC mode
+	call	snduart
+	res	1,c		; and reset internal graphic flag
+
+notg1:	pop	af
+notg2:	call	snduart
+	inc	hl		; inc. to next video location
+	ret
+
+; Send A to UART with HL, DE & BC saved
+
+
+snduart:push	bc
+	push	de
+	push	hl
+	call	outuart
+	pop	hl
+	pop	de
+	pop	bc
+	ret
+
+; ---------------- Bitty Character Routines -------------
+
+cnull:	ret
+
+; ESCape processing (set cursor positioning flag)
+
+cesc:	ld	a,001H		; tell terminal that next
+	ld	(esc$level),a	; characters are ESCape seq.
+	ret
+
+; Identify terminal capabilities as VT52.
+
+identify:
+	ld	a,esc
+	call	outuart
+	ld	a,'/'
+	call	outuart
+	ld	a,'K'
+	call	outuart
+	ret
+
+; Turn insert mode on
+
+insert$on:
+	ld	a,0ffh
+	ld	(insert$mode),a
+	ret
+
+; Turn insert mode off
+
+insert$off:
+	xor	a
+	ld	(insert$mode),a
+	ret
+
+; Enable keyboard
+
+en$keybd:
+	xor	a
+	ld	(keybd$locked),a
+	ret
+
+; Disable keyboard
+
+dis$keybd:
+	ld	a,0ffh
+	ld	(keybd$locked),a
+	ret
+
+; send cursor address
+
+read$curs:
+	ld	a,esc
+	call	outuart	
+	ld	a,'Y'
+	call	outuart
+	ld	a,(colmnum)
+	add	a,20h
+	call	outuart
+	ld	a,(rownum)
+	add	a,20h
+	call	outuart
+	ret
+
+; save cursor position
+
+save$curs:
+	ld	a,(rownum)
+	ld	(saved$row),a
+	ld	a,(colmnum)
+	ld	(saved$colm),a
+	ret
+
+; recall cursor position
+
+recall$curs:
+	ld	a,(saved$row)
+	cp	0
+	ld	b,a
+	ld	hl,0
+	ld	de,(num$colms)
+	jr	nz,get$row
+	ld	a,(saved$colm)
+	ld	l,a
+	ld	h,0
+	jp	movcurs
+
+get$row:add	hl,de
+	djnz	get$row
+	ld	a,(saved$colm)
+	ld	e,a
+	ld	d,0
+	add	hl,de
+	jp	movcurs
+
+; Start attribute
+
+csrtatr:ld	a,0FFH
+	ld	(atr$flag),a
+	ret
+
+; Stop the Attribute
+
+cstpatr:xor	a
+	ld	(atr$flag),a
+	ret
+
+; Start wrap around mode
+
+wrap$on:ld	a,0ffh
+	ld	(wrap$around),a
+	ret
+
+; Stop wrap around mode
+
+wrap$off:xor	a
+	ld	(wrap$around),a
+	ret
+
+; Graphics mode on
+
+graf$on:
+	ld	a,0ffh
+	ld	(graf$mode),a
+	ret
+
+; Graphics mode off
+
+graf$off:
+	xor	a
+	ld	(graf$mode),a
+	ret
+
+; --- Test mode ----
+
+test$mode:
+	ld	a,(esc$param1)
+	cp	'1'
+	jr	nz,not1
+
+; print all characters to screen that are received
+
+	call	clr$scn
+	ld	a,0ffh
+	ld	(wrap$around),a	; turn on wrap around mode
+
+tst1:	call	getachar
+	push	af
+	call	curs$mem
+	pop	af
+	ld	(hl),a
+	call	curs$rite
+	jr	tst1
+
+not1:	cp	'2'
+	jr	nz,not2
+
+; fill screen with characters in normal & inverse video 
+
+	ld	bc,(page$size)
+	ld	hl,(page$ptr)
+	ld	de,vid$mem
+	add	hl,de
+sto$mem:ld	a,r
+	sla	a		; make 0-255
+	ld	(hl),a
+	inc	hl
+	cpi
+	jp	pe,sto$mem
+	jp	chome
+
+not2:	cp	'3'
+	jr	nz,not3
+
+; fill memory with a character received from terminal
+; ESC t char
+
+	call	getachar
+	ld	bc,(page$size)
+	ld	hl,(page$ptr)
+	ld	de,vid$mem
+	add	hl,de
+tst2:	ld	(hl),a
+	cpi
+	jp	pe,tst2
+	ret
+
+not3:	cp	'4'	
+	ret	nz		; not recognized, return
+
+; modify the 6845 registers from remote computer
+
+; ESC t aa dd
+;   	aa = 6845 register number
+;	dd = data to send to register
+
+	call	getachar
+	out	(vid$reg),a
+	push	bc
+	call	getachar
+	out	(vid$data),a	
+	pop	bc
+	ld	b,a		; b = data, c = reg.
+
+	ld	a,c
+	cp	1		; R0?
+	jr	nz,tryR6
+	ld	a,b
+	ld	(num$colms),a
+	jr	setsize
+
+tryR6:	cp	6
+	ret	nz
+	ld	a,b
+	ld	(num$rows),a
+
+; set screen size if it was modified
+
+setsize:ld	a,(num$rows)
+	ld	b,a
+	ld	a,(num$colms)
+	ld	e,a
+	ld	d,0
+	ld	hl,0
+tst3:	add	hl,de
+	djnz	tst3
+	ld	(page$size),hl
+
+	xor	a
+	ld	(stat$line),a
+	jp	clr$scn		; clear the screen
+
+; ------------------ Video Update Routines ----------------
+
+; Print string pointed to by hl and terminated by 0
+
+prtstr:	push	de
+prt1:	ld	a,(hl)	; get the character
+	or	a
+	jr	z,prt2	; return if terminator
+	inc	hl
+	call	video	; go print it
+	jr	prt1
+prt2:	pop	de
+	ret
+	
+; Send A to video screen with attribute on
+
+video:	push	bc
+	push	hl
+	ld	c,a
+	cp	cr
+	jr	z,send$cr
+	cp	lf
+	jr	z,vid$ret
+
+; enter here with C=char, pushed bc+hl if dont want to
+; check for CR or LF (ie, in graphics mode)
+
+alt$video:
+	ld	a,(insert$mode)	; insert mode on?
+	or	a
+	jr	z,no$ins	; no, dont insert char
+	call	ins$blnk	; insert blank space at cursor
+no$ins:	calì	curs$meí	» geô currenô screeî location
+	ld	a,(atr$flag)	; see if any attributes..
+	or	a
+	ld	a,c		; get back character
+	jr	z,no$attr	; no attribute....
+	or	080H		; set attribute ON bit 7
+no$attr:ld	(hl),a		; put away the character
+	call	curs$rite	; and move cursor to the right
+vid$ret:pop	hl
+	pop	bc
+	ret
+
+send$cr:call	srt$line	; move cursor to start of line
+	call	clf		; send Line feed as well
+	jr	vid$ret
+
+; Tab over to next TAB stop (every 8 characters)
+; wrap$around and the status line problems are checked
+
+ctab:	ld	hl,colmnum	; point to current column number
+	ld	a,(num$colms)
+	sub	8
+	dec	a
+	cp	(hl)		; at last tab position or greater?
+	ret	c		; no need to tab any, so return
+
+	ld	a,(colmnum)
+	srl	a		; /2
+	srl	a		; /4
+	srl	a		; /8
+	sla	a		; *2
+	sla	a		; *4
+	sla	a		; *8
+	ld	b,a
+	ld	a,(colmnum)
+	sub	b		; get offset from last tab
+	ld	b,a
+	ld	a,8
+	sub	b		; get remainder of offset to next tab
+	ld	e,a
+	ld	d,0
+	push	de
+	call	getcurs		; get current cursor address
+	pop	de
+	add	hl,de
+	call	movcurs		; and move the cursor to new tab
+	ret
+
+; Move cursor up one line
+
+cupline:ld	a,(rownum)	; dont move up if at top line
+	cp	0
+	jr	z,try$loc	; dont return if in local mode
+cup2:	call	getcurs		; get current cursor location
+	ld	de,(num$colms)	; move offset up 1 line
+	or	a
+	sbc	hl,de
+	call	movcurs		; and move up 
+	ret
+
+; We are at the top line and in local mode, so do reverse scroll
+
+try$loc:ld	a,(rem$loc)	; what mode are we in?
+	or	a
+	ret	nz		; return if remote mode
+	ld	hl,(page$ptr)
+	ld	a,h
+	or	l		; see if zero
+	ret	z		; at start of memory, dont scroll
+	call	ptr$down
+	jr	cup2		; move cursor up one line
+
+; Move cursor one position to the left
+
+cbs:
+cur$left:ld	a,(colmnum)	; get present column number
+	cp	0
+	ret	z		; dont move past left column
+	call	getcurs		; get present cursor location
+	dec	hl		; move it to the left
+	call	movcurs
+	ret
+
+; Move cursor one space to the right in video memory
+; If wrap$around not on & end of line, then dont wrap around.
+
+curs$rite:push	af
+	push	bc
+	push	de
+	push	hl
+	ld	a,(num$colms)
+	dec	a
+	ld	hl,colmnum
+	cp	(hl)
+	jr	nz,colm$ok	; not at end of line yet, jump
+
+	call	in$stat$line	; see if on status line
+	jr	z,colm$notok	; dont go right anymore
+
+	ld	a,(wrap$around)	; see if wrap-around mode on
+	cp	0ffh
+	jr	nz,colm$notok	; no, so dont move cursor
+
+colm$ok:call	getcurs		; get cursor offset from 6845
+	inc	hl		; move cursor one space to the right
+	call	in$stat$line	
+	jr	nz,notsta	; not in status line, jump
+
+	call	movcurs		; in status line, so just update cursor
+	jr	colm$notok
+
+notsta:	call	new$pos	; and update the cursor offset to 6845
+
+colm$notok:
+	pop	hl
+	pop	de
+	pop	bc
+	pop	af
+	ret
+
+; Move cursor down (stop at bottom line)
+
+curs$dwn:call	in$stat$line
+	ret	z		; dont do it if in status line
+
+	ld	a,(num$rows)
+	dec	a
+	ld	hl,rownum
+	cp	(hl)		; see if on bottom row
+	ret	z		; yes, dont scroll
+	jr	clf		; do line feed
+
+; Home the cursor
+
+chome:	ld	hl,00		; set cursor offset to 0
+	call	movcurs		; move the cursor
+	ret
+
+; Clear this screen
+
+clr$scn:call	in$stat$line
+	jp	z,clear$stat$line
+clr2$scn:
+	ld	bc,(page$size)
+	ld	hl,(page$ptr)
+	call	erase
+	jp	chome
+	
+; Send Line Feed
+
+clf:	call	in$stat$line
+	ret	z
+	call	getcurs		; get current cursor location
+	ld	de,(num$colms)	; add offset of 1 line
+	add	hl,de
+	call	new$pos		; and update cursor position
+	ld	a,(send$cr$flg)
+	or	a		; send cr after lf?
+	ret	z		; no, return
+	call	srt$line	; do cr.
+	ret
+
+; Reverse line feed (scroll down if at top of screen)
+
+rev$lf:	call	in$stat$line
+	ret	z
+	ld	a,(rownum)
+	cp	0
+	jp	z,blk$dwn	; do reverse scroll
+	jp	cupline		; go move cursor up
+
+; Send Carriage Return (with optional lf)
+
+cnewline:call	srt$line	; move cursor to start of line
+	ld	a,(rem$loc)	; which mode are we in?
+	or	a
+	jr	nz,new1		; return if remote mode
+	jp	clf		; send Line feed as well
+
+new1:	ld	a,(send$lf)	; send optional line feed?
+	cp	0
+	ret	z		; no, just return
+	jp	clf
+
+; Move cursor to start of current line and return hl with
+; cursor offset to start of current line.
+
+srt$line:
+	push	de
+	call	getcurs
+	ld	a,(colmnum)	; get present column number
+	ld	d,0
+	ld	e,a
+	or	a
+	sbc	hl,de
+	call	movcurs		; move cursor to start of 
+				;   the current line.
+	pop	de
+	ret
+
+	
+; Point hl to cursor location in memory
+; Used by routines that access the screen directly
+
+curs$mem:push	de
+	push	af
+	call	getcurs		; get cursor offset from 6845
+	ld	de,vid$mem	; add base offset
+	add	hl,de
+	ld	de,(page$ptr)
+	add	hl,de
+	pop	af
+	pop	de
+	ret
+
+; Update cursor position (offset wrt start of screen found 
+; in hl) and do a scroll if at botom of screen.
+
+new$pos:ld	d,h		; store offset in de
+	ld	e,l
+	ld	a,(rem$loc)	; what mode are we in?
+	or	a
+	jr	z,loc$scrl	; jump if local mode
+
+; (a remote scroll screen does a screen block move)
+
+	ld	hl,(page$size)
+	dec	hl		; see if cursor has moved into
+	or	a		; the next page.
+	sbc	hl,de
+	jp	m,scroll$up	; yes, move screen up (hard)
+updcurs:ld	h,d		; and update 6845 cursor
+	ld	l,e		;   registers.
+	call	movcurs
+	ret
+
+; (a local scroll screen just moves the page pointer around)
+
+loc$scrl:ld	hl,077fH	; at end of video screen?
+	or	a		
+	sbc	hl,de
+	jr	c,up1line	; yes, go update video page
+	jr	updcurs		; go move the cursor
+
+; if cursor offscreen, just scroll screen up 1 line
+
+up1line:ld	hl,(page$ptr)	; get current page offset
+	add	hl,de
+	ld	bc,1400h	; last video addr+1
+	or	a
+	sbc	hl,bc
+	ret	nc		; return if > end of video memory
+
+	ld	hl,(page$ptr)	; get current page offset
+	ld	bc,0780H	; is cursor within our current
+	add	hl,bc		;  screen memory page?
+	ld	bc,1400h
+	or	a
+	sbc	hl,bc		; return if on last page (cant
+	ret	nc		; scroll into the work areas)
+	call	ptr$up		; no, soft scroll screen 1 line
+	ex	de,hl
+	ld	de,(num$colms)	; since page$ptr moves up 1 line
+	or	a		; then keep cursor location on
+	sbc	hl,de		; original line of old screen
+	ex	de,hl
+	jr	updcurs		; go move the cursor 
+
+; Move cursor to DE (relative to start of screen)
+
+new$loc:ld	h,d		; location ok, so move cursor
+	ld	l,e
+	call	movcurs
+	ret
+
+; Scroll first video page DOWN (hard - block move it)
+
+blk$dwn:ld	hl,(page$size)  ; block move 1st screen up
+	ld	de,(num$colms)
+	scf
+	ccf
+	sbc	hl,de
+	push	hl
+	pop	bc		; screen length - 1 line
+
+	ld	hl,vid$mem	
+	add	hl,bc
+	ld	de,(page$ptr)
+	add	hl,de
+	dec	hl		; HL = last char loc. of 2nd last row of screen 
+	push	hl
+	ld	de,(num$colms)
+	add	hl,de
+	ex	de,hl		; DE = last char of display
+	pop	hl
+ 	lddr
+	ld	bc,(num$colms)
+	ld	hl,(page$ptr)
+	call	erase		; erase top line
+	ret			; dont update cursor
+
+; get cursor offset into hl (relative to start of screen)
+
+getcurs:ld	a,00EH		; get cursor location (H)
+	out	(vid$reg),a
+	in	a,(vid$data)
+	ld	h,a
+	ld	a,00FH		; get cursor location (L)
+	out	(vid$reg),a
+	in	a,(vid$data)
+	ld	l,a
+	push	de
+	ld	de,(page$ptr)
+	or	a
+	sbc	hl,de		; make relative to start of screen
+	pop	de
+	ret
+
+; Move cursor to new offset found in hl (hl relative to start of screen)
+; then update row and column images
+
+movcurs:ex	af,af'		; speed things up
+	push	hl
+	push	de
+	push	hl		; save screen offset
+
+	ld	de,(page$ptr)	; get video start of page
+	add	hl,de
+	ld	a,00EH
+	out	(vid$reg),a
+	ld	a,h
+	out	(vid$data),a
+	ld	a,00FH
+	out	(vid$reg),a
+	ld	a,l
+	out	(vid$data),a
+
+; calculate the line number (0,1,2..)
+
+	pop	hl		; get screen offset
+	or	a
+	ld	a,0ffH
+	ld	de,(num$colms)	; compare in line increments
+line1:	inc	a		; inc to next line
+	sbc	hl,de
+	jp	p,line1		; not at current line yet..
+	ld	(rownum),a
+
+; now calculate the column number (0,1,2..)
+	
+	add	hl,de		; offset to column number
+	ld	a,l
+	ld	(colmnum),a
+
+	pop	de
+	pop	hl
+	ex	af,af'
+	ret
+
+; Update Start of video Memory to 6845 (hl holds OFFSET)
+; Must be relative to start of VIDEO MEMORY (0000)
+
+updat$vm:ld	a,00CH
+	out	(vid$reg),a
+	ld	a,H
+	out	(vid$data),a
+	ld	a,00DH
+	out	(vid$reg),a
+	ld	a,L
+	out	(vid$data),a
+	ld	(page$ptr),hl
+	ret
+
+; Scroll the current screen PAGE up 1 line (memory move)
+
+scroll$up:
+	push	af
+	push	bc
+	push	hl
+	ld	hl,(page$size)  ; block move 1st screen up
+	ld	de,(num$colms)
+	or	a
+	sbc	hl,de
+	push	hl
+	pop	bc		; bc = screen size - 1 row
+	ld	hl,(page$ptr)
+	ld	de,vid$mem
+	add	hl,de
+	push	hl
+	ld	de,(num$colms)
+	add	hl,de		; HL = 1st line down
+	pop	de
+	ldir
+	call	clr$bot		; clear bottom line
+	pop	hl
+	pop	bc
+	pop	af
+	ret
+
+; Clear bottom line and set cursor to start of bottom line
+
+clr$bot:ld	hl,(page$size)
+	ld	de,(num$colms)
+	or	a
+	sbc	hl,de		; screen size - 1 line
+	call	movcurs
+	ld	de,(page$ptr)
+	add	hl,de
+	ld	bc,(num$colms)
+	call	erase
+	ret
+
+; Move video memory pointer up 1 line
+
+ptr$up:	push	af
+	push	bc
+	push	hl
+	ld	hl,(page$ptr)	; get current page offset
+	ld	bc,(num$colms)	; add 1 line offset to it
+	add	hl,bc
+	call	updat$vm	; and update 6845 video
+	pop	hl		; memory start address register
+	pop	bc
+	pop	af
+	ret
+
+; Move video memory pointer down 1 line
+
+ptr$down:
+	push	af
+	push	bc
+	push	hl
+	ld	hl,(page$ptr)	; get current page offset
+	ld	bc,(num$colms)	; add 1 line offset to it
+	scf	
+	ccf
+	sbc	hl,bc
+	call	updat$vm	; and update 6845 video
+	pop	hl		; memory start address register
+	pop	bc
+	pop	af
+	ret
+
+
+; Erase line with cursor but leave cursor alone
+
+eras$line:
+	call	srt$line	; move to start of line
+	call	getcurs		; get cursor location
+	ld	de,(page$ptr)
+	add	hl,de
+	ld	bc,(num$colms)
+	call	erase		; and erase line
+	ret
+
+; Erase from home to cursor inclusive
+
+eras$top:
+	call	in$stat$line
+	ret	z
+	call	getcurs
+	inc	hl
+	push	hl
+	pop	bc
+	ld	hl,(page$ptr)	; start from top
+	jp	erase
+
+; Erase from cursor to end of display inclusive
+
+eras$end:
+	call	in$stat$line
+	ret	z
+	call	getcurs		; get cursor offset
+	push	hl		; save cursor location
+	ex	de,hl
+	ld	hl,(page$size)	; get size of screen
+	scf
+	ccf
+	sbc	hl,de		; HL = # of chars to erase
+	push	hl
+	pop	bc
+	pop	hl		; get back cursor location
+	ld	de,(page$ptr)
+	add	hl,de
+	jp	erase
+
+; Erase from left of line to cursor inclusive
+
+eras$left:
+	call	getcurs
+	ld	a,(colmnum)	; 0...xx
+	ld	c,a
+	inc	c
+	ld	b,0		; BC = number to erase
+	ld	e,a
+	ld	d,0
+	scf
+	ccf
+	sbc	hl,de		; HL = start of line address
+	ld	de,(page$ptr)	
+	add	hl,de
+	jp	erase
+
+; Erase from cursor to right of line inclusive
+
+eras$right:
+	ld	hl,colmnum
+	ld	a,(num$colms)
+	sub	(hl)
+	ld	b,0
+	ld	c,a
+	call	getcurs
+	ld	de,(page$ptr)
+	add	hl,de
+	jp	erase
+
+; move line to the right ready for a new char. under the cursor
+
+ins$chr:
+	ld	hl,colmnum
+	ld	a,(num$colms)
+	sub	(hl)
+	dec	a
+	ret	z		; at end of line, no space to insert
+	ld	b,0
+	ld	c,a
+	call	getcurs		; grab cursor location
+	ld	de,(page$ptr)
+	add	hl,de
+	ld	de,vid$mem
+	add	hl,de		; hl = absolute location of cursor
+	ld	de,(num$colms)	; get numbers of columns per line
+	add	hl,de
+	ld	a,(colmnum)
+	ld	d,0
+	ld	e,a
+	scf
+	ccf
+	sbc	hl,de		; hl = start of next line
+	dec	hl		; hl = end of this line
+	push	hl
+	pop	de		; destination
+	dec	hl		; hl = end of line - 1
+	lddr			; (de)=(hl), de-1, hl-1, bc-1, repeat
+	ret
+
+; Insert a blank at the cursor
+
+ins$blnk:
+	push	bc
+	call	ins$chr
+	ld	bc,1
+	call	getcurs
+	ld	de,(page$ptr)
+	add	hl,de
+	call	erase
+	pop	bc
+	ret
+
+; Insert line at the cursor
+
+ins$line:
+	call	in$stat$line
+	ret	z		; quit if in status line
+
+	call	srt$line	; move cursor to start of line
+	ld	hl,(page$size)
+	dec	hl		; HL = last char of display = destination
+	ld	de,(num$colms)
+	scf
+	ccf
+	sbc	hl,de		; hl = last line addr
+	push	hl		; save source
+
+	call	getcurs
+	ex	de,hl
+	pop	hl
+	push	hl
+	scf
+	ccf
+	sbc	hl,de		; subtract cursor position
+	push	hl
+	pop	bc		; BC = number to move
+	
+	jp	m,ins1		; jump if bottom line
+
+	inc	bc		; correct move count
+
+	pop	hl		; get source
+	ld	de,(page$ptr)
+	add	hl,de
+	ld	de,vid$mem
+	add	hl,de
+	push	hl		; save source
+
+	ld	de,(page$size)
+	dec	de		; get destination
+	ld	hl,(page$ptr)
+	add	hl,de
+	ld	de,vid$mem
+	add	hl,de
+	ex	de,hl
+	pop	hl		; get back source
+
+	lddr
+ins1:	call	eras$line
+	ret
+
+; Delete line at the cursor
+
+del$line:
+	call	in$stat$line	; in the status line?
+	ret	z		; yes, just return
+	
+	call	srt$line
+
+	ld	hl,rownum
+	ld	a,(num$rows)
+	dec	a
+	cp	(hl)
+	jr	z,bot$lin	; on bottom line, dont delete
+
+	call	getcurs
+	push	hl		; save destination
+
+	ld	de,(num$colms)
+	add	hl,de
+	push	hl		; save source
+
+	ld	de,(page$size)
+	ex	de,hl
+	scf
+	ccf
+	sbc	hl,de
+	push	hl
+	pop	bc
+	ld	a,b
+	or	c
+	jr	z,bot$lin
+
+	pop	hl		; get source
+	ld	de,(page$ptr)
+	add	hl,de
+	ld	de,vid$mem
+	add	hl,de
+
+	pop	de		; get destination
+	push	hl		; save source
+
+	ld	hl,(page$ptr)
+	add	hl,de
+	ld	de,vid$mem
+	add	hl,de
+	ex	de,hl		; DE = destination
+	pop	hl		; get source
+	ldir
+bot$lin:call	getcurs
+	push	hl
+	call	clr$bot		; clear bottom line
+	pop	hl
+	jp	movcurs
+
+; Delete character under cursor and add blank at right
+
+del$char:
+	ld	hl,colmnum
+	ld	a,(num$colms)
+	sub	(hl)
+	dec	a
+	ld	b,0
+	ld	c,a		; bc = # of chars to move
+
+	call	getcurs
+	ld	de,(page$ptr)
+	add	hl,de
+	ld	de,vid$mem
+	add	hl,de
+	push	hl
+	pop	de
+	inc	hl
+
+	ld	a,c
+	cp	0
+	jr	z,nochars
+	ldir			; move line to the right
+
+; now delete character at end of the line
+
+nochars:ex	de,hl
+	ld	a,(atr$flag)	; see if any attributes..
+	or	a
+	ld	a,20h
+	jr	z,noattr3	; no attribute....
+	or	080H		; set attribute ON bit 7
+noattr3:ld	(hl),a
+	ret
+
+; Erase BC bytes from HL (inverse taken into account)
+; ** HL relative to start of video memory (0000)
+
+; ie. bc = 40h = erase 40 characters
+
+
+erase:	push	de
+	ld	de,vid$mem
+	add	hl,de		; make absolute address
+	ld	a,(atr$flag)	; see if any attributes..
+	or	a
+	ld	a,20h
+	jr	z,noattr2	; no attribute....
+	or	080H		; set attribute ON bit 7
+noattr2:ld	e,a
+	ld	a,b
+	or	c
+	jr	z,era$ret
+	ld	a,e
+erase1:	ld	(hl),a
+	ld	a,b
+	or	a
+	jr	nz,erase2
+	ld	a,c
+	cp	1		; if erase 1 char only
+	jr	z,era$ret	; then we are done, dont block move
+
+erase2:	push	hl		; get source
+	pop	de		; make destination
+	inc	de
+	dec	bc
+	ldir			; bc = count
+
+era$ret:pop	de
+	ret
+
+; ----------------- Status line routines ----------------
+
+stat$line$on:
+	ld	a,(rem$loc)
+	or	a
+	ret	z		; no status line in local mode
+	ld	a,(stat$line)
+	or	a
+	ret	nz		; return if status line already on
+	ld	a,0ffh		; say we have a status line
+	ld	(stat$line),a
+	ld	a,(screen$mode)
+	inc	a		; go to status line modes
+	ld	(screen$mode),a
+	call	getcurs
+	push	hl
+	ld	hl,(page$ptr)	; get start of screen
+	call	pgm$6845
+	pop	hl
+	call	movcurs		; move cursor back to original position
+	call	clear$stat$line
+	ret
+
+stat$line$off:
+	ld	a,(rem$loc)
+	or	a
+	ret	z		; no status line in local mode
+	ld	a,(stat$line)
+	or	a
+	ret	z		; return if status line already off
+	xor	a
+	ld	(stat$line),a	; say no status line
+	ld	a,(screen$mode)
+	dec	a		; go to normal mode
+	ld	(screen$mode),a
+	ld	hl,(page$ptr)	; get start of screen
+	call	pgm$6845	; and program chip
+	ld	hl,0000
+	call	movcurs		; home the cursor
+	ret
+
+; Check to see if we are on the status line
+; Z if in line, NZ if not in line
+
+in$stat$line:
+	ld	a,(stat$line)	; see if we have a status line
+	cp	0ffh		; yes?
+	ret	nz		; say no line
+
+	ld	a,(rem$loc)
+	cpl
+	or	a
+	ret	nz		; no status line in local mode
+
+	push	hl
+	ld	a,(num$rows)	; get # of screen lines
+	inc	a		; inc to status line
+	ld	hl,rownum
+	cp	(hl)
+	pop	hl
+	ret
+
+; clear status line
+
+clear$stat$line:
+	ld	a,(rem$loc)
+	or	a
+	ret	z		; no status line in local mode
+	ld	a,(stat$line)
+	cp	0
+	ret	z		; no status line, dont clear
+	call	getcurs		
+	push	hl		; get original cursor location
+
+	ld	hl,(page$size)
+	ld	de,(page$ptr)
+	add	hl,de
+	ld	bc,(num$colms)
+	call	erase
+	call	srt$line	; move cursor to start of line
+
+	pop	hl
+	call	movcurs		; move cursor back
+
+	ret
+
+; ------------------ Miscellaneous Routines ----------------
+
+; Send out Bell tone to speaker
+
+cbell:	ld	a,000H		; set timer to 61 hz?
+	out	(timer$2),a
+	ld	a,008H
+	out	(timer$2),a
+	call	delay
+	ld	a,0B6H		; reset status to counter 2
+	out	(timer$stat),a
+	ret
+
+; delay 80 ms.
+
+delay:	ld	c,027H		; 7
+delay1:	call	wait		; 17 -
+	dec	C		; 4   | 2.03 ms
+	jr	nz,delay1	; 12 -
+	ret			; 10
+
+; Wait 2 ms
+
+wait:	ld	b,000H		; 7
+wait1:	nop			; 4
+	djnz	wait1		; 13
+	ret			; 10
+
+; ------------ Default Modification Via ESC --------------
+
+; Set baudrate from ESC r @-O
+
+set$baud:
+	ld	a,(esc$param1)	; get parameter
+	sub	'@'		; make 0-15
+	ld	b,a
+	ld	a,15
+	sub	b		; reverse order
+	and	0fh
+	ld	(baudrate),a
+	jp	prgbaud		; and program baudrate
+
+set$mode:
+	ld	a,(esc$param1)
+	cp	'x'		; setup mode wanted?
+	jr	nz,setm1	; no, skip
+set1:	call	setup$screen	; goto setup screen mode
+	ret
+
+setm1:	cp	'X'		; setup mode wanted?
+	jr	z,set1
+	cp	'<' + 1		; check for bounds
+	ret	nc
+	cp	'0'
+	ret	c
+	sub	'0'
+	sla	a
+	ld	e,a
+	ld	d,0
+	ld	hl,set$tbl
+	add	hl,de
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a
+	jp	(hl)
+
+set$tbl:defw	blink$cursor	; 0 - blinking cursor (default)
+	defw	stat$line$on	; 1 - status line on 
+	defw	beep$off	; 2 - end of line beep off (default)
+	defw	enable$hold	; 3 - enable "holdscreen" mode
+	defw	block$cursor	; 4 - block character cursor
+	defw	cursor$off	; 5 - no cursor
+	defw	no$equiv	; 6 - enter "keypad shifted" mode
+	defw	no$equiv	; 7 - enter "alternate keypad" mode
+	defw	auto$lf$on	; 8 - auto lf > cr on
+	defw	auto$cr$on	; 9 - auto cr > lf on
+	defw	select$2nd	; : - select 2nd screen
+	defw	select$dim	; ; - select DIM attribute
+	defw	xon$off		; < - turn xon/xoff handshaking off
+
+reset$mode:
+	ld	a,(esc$param1)
+
+rst2:	cp	'<' + 1		; check for bounds
+	ret	nc
+	cp	'0'
+	ret	c
+	sub	'0'
+	sla	a
+	ld	e,a
+	ld	d,0
+	ld	hl,reset$tbl
+	add	hl,de
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a
+	jp	(hl)
+
+reset$tbl:
+	defw	no$blink	; 0 - no blinking cursor
+	defw	stat$line$off	; 1 - no status line (default)
+	defw	beep$on		; 2 - end of line beep on
+	defw	disable$hold	; 3 - disable "holdscreen" mode
+	defw	under$cursor	; 4 - underscore cursor
+	defw	cursor$on	; 5 - enable cursor
+	defw	no$equiv	; 6 - exit "keypad shifted" mode
+	defw	no$equiv	; 7 - exit "alternate keypad mode"
+	defw	auto$lf$off	; 8 - auto lf > cr off (default)
+	defw	auto$cr$off	; 9 - auto cr > lf off (default)
+	defw	select$1st	; : - select 1st screen
+	defw	select$rev	; ; - select REV attribute (default)
+	defw	xon$on		; < - turn xon/xoff handshaking on
+
+no$equiv:ret
+
+; enable hold screen mode
+
+enable$hold:
+	jr	no$equiv	; NOT IMPLEMENTED
+
+; disable hold screen mode
+
+disable$hold:
+	jr	no$equiv	; NOT IMPLIMENTED 
+
+; turn on xon/xoff handshaking
+
+xon$on:	ld	a,0ffh
+	ld	(use$xon),a
+	ret
+
+; turn off xon/xoff handshaking
+
+xon$off:xor	a
+	ld	(use$xon),a
+	ret
+
+blink$cursor:
+	ld	a,0ffh
+	ld	(blink),a
+	ld	a,(curs$start)
+	and	1fh
+	or	60h
+	ld	(curs$start),a
+	jp	pgm$cursor
+
+beep$on:ld	a,0ffh
+	ld	(eoln$beep),a
+	ret
+
+block$cursor:
+	ld	a,(curs$start)
+	and	60h		; start on 0, end on 9
+	ld	(curs$start),a
+	ld	a,9
+	ld	(curs$end),a
+	jp	pgm$cursor
+
+auto$lf$on:
+	ld	a,0ffh
+	ld	(send$lf),a
+	ret
+
+auto$cr$on:
+	ld	a,0ffh
+	ld	(send$cr$flg),a
+	ret
+
+select$2nd:
+	ld	a,(rem$loc)
+	or	a
+	ret	z		; return if local mode (no change allowed)
+
+	ld	a,(screen$mode) ; don't goto # 2 if in 96*40
+	cp	2
+	ret	z
+	cp	3
+	ret	z
+
+	ld	a,(screen$num)
+	cp	1
+	ret	z		; already in screen 1!!
+	call	getcurs		; get cursor location
+	push	hl
+	ld	a,1
+	ld	(screen$num),a
+	ld	hl,screen2
+	call	updat$vm
+	ld	hl,(alt$curs)	; switch screen's cursor locations
+	call	movcurs
+	pop	hl
+	ld	(alt$curs),hl	; and store away old cursor loc.
+	ret
+
+select$dim:
+	ld	a,1		; select dim attribute
+	ld	(atrtype),a
+	call	prg$atr		; program the attributes
+	ret
+
+cursor$off:
+	ld	a,(curs$start)
+	and	1fh
+	or	20h
+	ld	(curs$start),a
+	jp	pgm$cursor
+
+no$blink:
+	xor	a
+	ld	(blink),a
+	ld	a,(curs$start)
+	and	1fh
+	ld	(curs$start),a
+	jr	pgm$cursor
+
+beep$off:xor	a
+	ld	(eoln$beep),a
+	ret
+
+under$cursor:
+	ld	a,(curs$start)
+	and	060h		; kill start line
+	or	8		; start on line 8, end on 9
+	ld	(curs$start),a
+	ld	a,9
+	ld	(curs$end),a
+	jp	pgm$cursor
+
+auto$lf$off:
+	xor	a
+	ld	(send$lf),a
+	ret
+
+auto$cr$off:
+	xor	a
+	ld	(send$cr$flg),a
+	ret
+
+; select the first video screen
+
+select$1st:
+	ld	a,(rem$loc)
+	or	a
+	ret	z		; return if local mode (no change allowed)
+
+	ld	a,(screen$num)
+	cp	0
+	ret	z		; already in screen 0!!
+	call	getcurs		; get cursor location
+	push	hl
+	ld	a,0
+	ld	(screen$num),a
+	ld	hl,screen1
+	call	updat$vm
+	ld	hl,(alt$curs)	; switch screen's cursor locations
+	call	movcurs
+	pop	hl
+	ld	(alt$curs),hl	; and store away old cursor loc.
+	ret
+
+select$rev:
+	ld	a,2
+	ld	(atrtype),a
+	call	prg$atr		; and program the attributes
+	ret
+
+cursor$on:
+	push	bc
+	ld	a,(blink)	; see if blinking was on
+	cp	0ffh
+	ld	b,060h
+	jr	z,set		; yes it was
+	ld	b,0
+set:	ld	a,(curs$start)
+	and	1fh
+	or	b
+	ld	(curs$start),a
+	call	pgm$cursor
+	pop	bc
+	ret
+
+; Program cursor mode to 6845
+
+pgm$cursor:
+	ld	a,(interlace)
+	or	a
+	jr	z,noti		; not interlace mode
+
+	ld	a,10		; for interlace mode
+	out	(vid$reg),a	;   start cursor on odd line
+	ld	a,(curs$start)
+	cp	9
+	jr	z,nochg		; if already come thru here
+	cp	1		; while in interlace mode
+	jr	z,nochg		; then dont re-inc the variable!
+	inc	a
+nochg:	out	(vid$data),a
+	jr	pgmh
+
+noti:	ld	a,10
+	out	(vid$reg),a
+	ld	a,(curs$start)
+	out	(vid$data),a
+
+pgmh:	ld	a,11
+	out	(vid$reg),a
+	ld	a,(curs$end)
+	out	(vid$data),a
+	ret
+
+; select screen mode by ESC s @-G
+
+set$crtc$mode:
+	ld	a,(rem$loc)	; see if in remote mode
+	or	a
+	jr	nz,yesre	; yes, skip
+	ret			; dont allow change if in local mode
+
+yesre:	ld	a,(esc$param1)
+	cp	'Z'+1
+	jr	c,under		; make lowercase
+	sub	'A' + 20h
+	jr	u2
+
+under:	sub	'@'
+u2:	cp	3
+	jr	c,u$ok		; modes B,C, E-F not supported
+	cp	4
+	ret	nz
+	ld	a,2		; translate Mode D to internal offset 2
+
+u$ok:	sla	a		; allow for status line modes
+	cp	2		; 48*96?
+	jr	nz,notbig	; no, jump
+	push	af
+	call	select$1st	; select first screen since this
+	pop	af		; mode uses so much ram!
+	
+notbig:	ld	b,a
+	ld	a,(stat$line)
+	cp	0
+	ld	a,b
+	jr	z,nosta		; no status line, dont clear
+	inc	a		; turn on status line video mode	
+
+nosta:	ld	hl,screen$mode
+	cp	(hl)		; see if video mode has changed
+	push	af		; save status
+	ld	(screen$mode),a
+	pop	af
+	jr	z,u3
+
+; if video mode changed then clear the screen
+
+	call	clear$stat$line	; clear the status line if it is on
+	call	clr2$scn	; clear the screen
+
+u3:	ld	hl,(page$ptr)	; get start of screen
+	call	pgm$6845
+	ld	hl,0000
+	call	movcurs		; home cursor
+	ret
+
+; ----------------------------------------------------------
+
+; 16 bit compare , Enter with HL and DE
+;		   Exit with Zero flag and carry flag setup
+
+cphlde:	push	hl
+	or	a
+	sbc	hl,de
+	pop	hl
+	ret
+
+; ----------------------------------------------------------
+
+ 	end
+

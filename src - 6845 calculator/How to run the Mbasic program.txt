@@ -1,0 +1,4 @@
+1) Start up Z80 CP/M
+
+2) Execute in this directory: 
+	mbasic52 calc6845.asc

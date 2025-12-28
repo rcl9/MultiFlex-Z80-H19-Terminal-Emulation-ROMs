@@ -1,0 +1,8 @@
+https://github.com/rcl9/MultiFlex-Z80-H19-Terminal-Emulation-ROMs
+
+Before placing the files on GitHub I made these changes:
+
+1) My name was changed to "RCL9".
+
+2) Attribute was changed to:
+	RCL9 (Rob's Retro Computing Archive) - RetroComputingArchive@gmail.com, github.com/rcl9
