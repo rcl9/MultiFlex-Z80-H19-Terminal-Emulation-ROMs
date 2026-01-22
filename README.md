@@ -10,7 +10,6 @@ hardware but with lackluster software support.
 <img src="/docs/multiflex terminal board (1982).jpg" alt="" style="width:75%; height:auto;">
 </div>
 
-
 If you are an existing owner of this terminal board then it is quite easy to migrate to
 this new expanded level of terminal emulation by burning 1, 2 or 3 ROM images (2716, 2732 and 2764) and
 making some optional minor hardware modifications. Source code and documentaiton is provided in
